@@ -91,6 +91,10 @@ class EntrypointTests(unittest.TestCase):
                 script = kit / "scripts" / phase
                 script.write_text('#!/usr/bin/env bash\n'
                                   'printf "%s\\n" "${0##*/}" >> "$SE1_TEST_CALLS"\n'
+                                  'if [[ "${0##*/}" == verify-preparation.sh ]]; then\n'
+                                  '  [[ "$PREPARED_SOURCE" == "$SE1_TEST_WORK/source" && '
+                                  '"$PREPARED_STATE" == "$SE1_TEST_WORK/state" ]] || exit 74\n'
+                                  'fi\n'
                                   '[[ "${0##*/}" != "$SE1_TEST_FAIL" ]]\n')
                 script.chmod(0o755)
             podman = root / "bin/podman"
@@ -108,6 +112,7 @@ class EntrypointTests(unittest.TestCase):
                  "--seed", str(root / "seed"), "--contrib-cache", str(root / "cache")],
                 env={**os.environ, "SE1_PROJECT_KIT": str(kit),
                      "PATH": str(root / "bin") + os.pathsep + os.environ["PATH"],
+                     "SE1_TEST_WORK": str(root / "work"),
                      "SE1_TEST_CALLS": str(calls), "SE1_TEST_FAIL": fail_phase},
                 text=True, capture_output=True, timeout=20)
             return result, calls.read_text().splitlines()

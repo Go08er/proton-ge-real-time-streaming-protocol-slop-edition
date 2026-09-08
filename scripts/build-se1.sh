@@ -122,7 +122,7 @@ actual_image="$("${sdk_env[@]}" podman image inspect --format '{{.Id}}' "$PIN_ST
   printf 'SDK image identity differs from the pin; refusing the build.\n' >&2
   exit 1
 }
-PREPARED_SOURCE="$source_dir" scripts/verify-preparation.sh \
+PREPARED_SOURCE="$source_dir" PREPARED_STATE="$state_dir" scripts/verify-preparation.sh \
   --config "$PINNED_GE_CONFIG" --series "$series"
 scripts/build-pinned-ge.sh --config "$PINNED_GE_CONFIG" --series "$series" \
   --source "$source_dir" --state-dir "$state_dir" --build-dir "$build_dir" \
