@@ -1,0 +1,482 @@
+From: RTSP-on-GE11 contributors <noreply@invalid>
+Subject: [PATCH] mfmediaengine: Make source generations reentrancy-safe.
+
+Media engine source resolution can complete after a newer SetSource() call or
+after shutdown. Give every Begin operation an explicit, refcounted origin and
+generation context, always drain the matching End operation, and shut down
+objects returned by stale completions.
+
+The initial generation comparison is not sufficient because MediaEngine
+notifications and old-source shutdown can reenter SetSource(), while
+presentation cleanup deliberately drops the engine lock. Capture each
+generation locally, revalidate it after PURGE, Begin, LOADSTART, and topology
+cleanup, and detach the old presentation before dropping the lock. Pass the
+generation through topology construction so an older callback cannot install
+over a newer source.
+
+Track the current Play/Pause intent independently while a source is loading,
+and clear source/play pending flags when SetSource() receives no URL or byte
+stream. Reject an out-of-memory URL copy needed by the asynchronous WineDMO
+handler.
+
+Non-shutdown MEError propagation remains deliberately deferred. This
+quarantined candidate is not part of patches/series.
+
+The license of each modified Wine source file applies to this patch.
+---
+ dlls/mfmediaengine/main.c   | 272 +++++++++++++++++++++++++++++++-----
+ dlls/winedmo/media_source.c |   3 +
+ 2 files changed, 237 insertions(+), 38 deletions(-)
+
+diff --git a/dlls/mfmediaengine/main.c b/dlls/mfmediaengine/main.c
+--- a/dlls/mfmediaengine/main.c
++++ b/dlls/mfmediaengine/main.c
+@@ -142,6 +142,22 @@ struct effects
+     size_t capacity;
+ };
+ 
++enum media_engine_load_origin
++{
++    MEDIA_ENGINE_LOAD_EXTENSION,
++    MEDIA_ENGINE_LOAD_URL,
++    MEDIA_ENGINE_LOAD_BYTESTREAM,
++};
++
++struct media_engine_load_context
++{
++    IUnknown IUnknown_iface;
++    LONG refcount;
++    enum media_engine_load_origin origin;
++    UINT64 generation;
++    IMFByteStream *bytestream;
++};
++
+ struct media_engine
+ {
+     IMFMediaEngineEx IMFMediaEngineEx_iface;
+@@ -155,9 +171,11 @@ struct media_engine
+     IMFDXGIDeviceManager *device_manager;
+     HANDLE device_handle;
+     enum media_engine_mode mode;
++    UINT64 source_generation;
+     unsigned int flags;
+     double playback_rate;
+     double default_playback_rate;
++    BOOL playback_requested;
+     double volume;
+     double duration;
+     double current_seek;
+@@ -1415,27 +1433,36 @@ static HRESULT media_engine_create_video_renderer(struct media_engine *engine, I
+     return hr;
+ }
+ 
++static BOOL media_engine_source_is_current(struct media_engine *engine, UINT64 generation)
++{
++    return !(engine->flags & FLAGS_ENGINE_SHUT_DOWN) && generation == engine->source_generation;
++}
++
+ /* must be called with engine->cs held */
+ static void media_engine_clear_presentation(struct media_engine *engine)
+ {
+-    if (engine->presentation.source)
++    IMFPresentationDescriptor *pd = engine->presentation.pd;
++    struct video_frame_sink *frame_sink = engine->presentation.frame_sink;
++    IMFMediaSource *source = engine->presentation.source;
++
++    /* Detach the old presentation before dropping the lock.  A concurrent
++     * source load may install a new presentation while Shutdown() drains its
++     * callbacks; the old cleanup must never release or clear that new state. */
++    memset(&engine->presentation, 0, sizeof(engine->presentation));
++
++    if (source)
+     {
+         /* critical section can not be held during shutdown, as shut down requires all pending
+          * callbacks to complete, and some callbacks require this cs */
+         LeaveCriticalSection(&engine->cs);
+-        IMFMediaSource_Shutdown(engine->presentation.source);
++        IMFMediaSource_Shutdown(source);
+         EnterCriticalSection(&engine->cs);
+-        IMFMediaSource_Release(engine->presentation.source);
+-    }
+-    if (engine->presentation.pd)
+-        IMFPresentationDescriptor_Release(engine->presentation.pd);
+-    if (engine->presentation.frame_sink)
+-    {
+-        video_frame_sink_release(engine->presentation.frame_sink);
+-        engine->presentation.frame_sink = NULL;
++        IMFMediaSource_Release(source);
+     }
+-
+-    memset(&engine->presentation, 0, sizeof(engine->presentation));
++    if (pd)
++        IMFPresentationDescriptor_Release(pd);
++    if (frame_sink)
++        video_frame_sink_release(frame_sink);
+ }
+ 
+ static void media_engine_clear_effects(struct effects *effects)
+@@ -1452,7 +1479,7 @@ static void media_engine_clear_effects(struct effects *effects)
+     memset(effects, 0, sizeof(*effects));
+ }
+ 
+-static HRESULT media_engine_create_topology(struct media_engine *engine, IMFMediaSource *source)
++static HRESULT media_engine_create_topology(struct media_engine *engine, IMFMediaSource *source, UINT64 generation)
+ {
+     IMFStreamDescriptor *sd_audio = NULL, *sd_video = NULL;
+     IMFPresentationDescriptor *pd;
+@@ -1461,9 +1488,18 @@ static HRESULT media_engine_create_topology(struct media_engine *engine, IMFMedi
+     UINT64 duration;
+     HRESULT hr;
+ 
++    if (!media_engine_source_is_current(engine, generation))
++        return MF_E_OPERATION_CANCELLED;
++
+     media_engine_release_video_frame_resources(engine);
+     media_engine_clear_presentation(engine);
+ 
++    /* media_engine_clear_presentation() drops engine->cs while the previous
++     * source shuts down.  Do not let an older callback replace a source that
++     * became current during that window. */
++    if (!media_engine_source_is_current(engine, generation))
++        return MF_E_OPERATION_CANCELLED;
++
+     if (FAILED(hr = IMFMediaSource_CreatePresentationDescriptor(source, &pd)))
+         return hr;
+ 
+@@ -1516,6 +1552,16 @@ static HRESULT media_engine_create_topology(struct media_engine *engine, IMFMedi
+         return E_UNEXPECTED;
+     }
+ 
++    if (!media_engine_source_is_current(engine, generation))
++    {
++        if (sd_video)
++            IMFStreamDescriptor_Release(sd_video);
++        if (sd_audio)
++            IMFStreamDescriptor_Release(sd_audio);
++        IMFPresentationDescriptor_Release(pd);
++        return MF_E_OPERATION_CANCELLED;
++    }
++
+     engine->presentation.source = source;
+     IMFMediaSource_AddRef(engine->presentation.source);
+     engine->presentation.pd = pd;
+@@ -1616,38 +1662,136 @@ static void media_engine_start_playback(struct media_engine *engine)
+     engine->presentation.start_position.vt = VT_EMPTY;
+ }
+ 
++static inline struct media_engine_load_context *impl_from_load_context_IUnknown(IUnknown *iface)
++{
++    return CONTAINING_RECORD(iface, struct media_engine_load_context, IUnknown_iface);
++}
++
++static HRESULT WINAPI media_engine_load_context_QueryInterface(IUnknown *iface, REFIID riid, void **obj)
++{
++    if (IsEqualIID(riid, &IID_IUnknown))
++    {
++        *obj = iface;
++        IUnknown_AddRef(iface);
++        return S_OK;
++    }
++
++    *obj = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI media_engine_load_context_AddRef(IUnknown *iface)
++{
++    struct media_engine_load_context *context = impl_from_load_context_IUnknown(iface);
++    return InterlockedIncrement(&context->refcount);
++}
++
++static ULONG WINAPI media_engine_load_context_Release(IUnknown *iface)
++{
++    struct media_engine_load_context *context = impl_from_load_context_IUnknown(iface);
++    ULONG refcount = InterlockedDecrement(&context->refcount);
++
++    if (!refcount)
++    {
++        if (context->bytestream)
++            IMFByteStream_Release(context->bytestream);
++        free(context);
++    }
++
++    return refcount;
++}
++
++static const IUnknownVtbl media_engine_load_context_vtbl =
++{
++    media_engine_load_context_QueryInterface,
++    media_engine_load_context_AddRef,
++    media_engine_load_context_Release,
++};
++
++static HRESULT media_engine_load_context_create(enum media_engine_load_origin origin, UINT64 generation,
++        IMFByteStream *bytestream, struct media_engine_load_context **out)
++{
++    struct media_engine_load_context *context;
++
++    if (!(context = calloc(1, sizeof(*context))))
++        return E_OUTOFMEMORY;
++
++    context->IUnknown_iface.lpVtbl = &media_engine_load_context_vtbl;
++    context->refcount = 1;
++    context->origin = origin;
++    context->generation = generation;
++    context->bytestream = bytestream;
++    if (context->bytestream)
++        IMFByteStream_AddRef(context->bytestream);
++
++    *out = context;
++    return S_OK;
++}
++
++static HRESULT media_engine_end_source_load(struct media_engine *engine, struct media_engine_load_context *context,
++        IMFAsyncResult *result, IUnknown **object)
++{
++    MF_OBJECT_TYPE obj_type;
++
++    switch (context->origin)
++    {
++        case MEDIA_ENGINE_LOAD_EXTENSION:
++            return IMFMediaEngineExtension_EndCreateObject(engine->extension, result, object);
++        case MEDIA_ENGINE_LOAD_URL:
++            return IMFSourceResolver_EndCreateObjectFromURL(engine->resolver, result, &obj_type, object);
++        case MEDIA_ENGINE_LOAD_BYTESTREAM:
++            return IMFSourceResolver_EndCreateObjectFromByteStream(engine->resolver, result, &obj_type, object);
++        default:
++            return E_UNEXPECTED;
++    }
++}
++
++static void media_engine_discard_source_object(IUnknown *object)
++{
++    IMFMediaSource *source;
++    HRESULT hr;
++
++    if (!object)
++        return;
++
++    if (SUCCEEDED(IUnknown_QueryInterface(object, &IID_IMFMediaSource, (void **)&source)))
++    {
++        if (FAILED(hr = IMFMediaSource_Shutdown(source)))
++            WARN("Failed to shut down discarded media source, hr %#lx.\n", hr);
++        IMFMediaSource_Release(source);
++    }
++    IUnknown_Release(object);
++}
++
+ static HRESULT WINAPI media_engine_load_handler_Invoke(IMFAsyncCallback *iface, IMFAsyncResult *result)
+ {
+     struct media_engine *engine = impl_from_load_handler_IMFAsyncCallback(iface);
+-    IUnknown *object = NULL, *state;
++    struct media_engine_load_context *context;
++    IUnknown *object = NULL, *state = NULL;
+     unsigned int start_playback;
+-    MF_OBJECT_TYPE obj_type;
+     IMFMediaSource *source;
++    UINT64 generation;
+     HRESULT hr;
+ 
+-    EnterCriticalSection(&engine->cs);
+-
+-    if (engine->flags & FLAGS_ENGINE_SHUT_DOWN)
++    if (FAILED(hr = IMFAsyncResult_GetState(result, &state)))
+     {
+-        LeaveCriticalSection(&engine->cs);
++        WARN("Source load result has no context, hr %#lx.\n", hr);
+         return S_OK;
+     }
+ 
+-    engine->network_state = MF_MEDIA_ENGINE_NETWORK_LOADING;
+-    IMFMediaEngineNotify_EventNotify(engine->callback, MF_MEDIA_ENGINE_EVENT_LOADSTART, 0, 0);
++    context = impl_from_load_context_IUnknown(state);
++    hr = media_engine_end_source_load(engine, context, result, &object);
++    generation = context->generation;
++    IUnknown_Release(state);
+ 
+-    start_playback = (engine->flags & FLAGS_ENGINE_PLAY_PENDING) || !(engine->flags & FLAGS_ENGINE_PAUSED);
+-    media_engine_set_flag(engine, FLAGS_ENGINE_SOURCE_PENDING | FLAGS_ENGINE_PLAY_PENDING, FALSE);
++    EnterCriticalSection(&engine->cs);
++    if (!media_engine_source_is_current(engine, generation))
++        goto stale;
+ 
+-    if (engine->extension)
+-        hr = IMFMediaEngineExtension_EndCreateObject(engine->extension, result, &object);
+-    else if (SUCCEEDED(IMFAsyncResult_GetState(result, &state)))
+-    {
+-        hr = IMFSourceResolver_EndCreateObjectFromByteStream(engine->resolver, result, &obj_type, &object);
+-        IUnknown_Release(state);
+-    }
+-    else
+-        hr = IMFSourceResolver_EndCreateObjectFromURL(engine->resolver, result, &obj_type, &object);
++    engine->network_state = MF_MEDIA_ENGINE_NETWORK_LOADING;
++    IMFMediaEngineNotify_EventNotify(engine->callback, MF_MEDIA_ENGINE_EVENT_LOADSTART, 0, 0);
++    if (!media_engine_source_is_current(engine, generation))
++        goto stale;
+ 
+     if (FAILED(hr))
+         WARN("Failed to create source object, hr %#lx.\n", hr);
+@@ -1656,12 +1800,24 @@ static HRESULT WINAPI media_engine_load_handler_Invoke(IMFAsyncCallback *iface,
+     {
+         if (SUCCEEDED(hr = IUnknown_QueryInterface(object, &IID_IMFMediaSource, (void **)&source)))
+         {
+-            hr = media_engine_create_topology(engine, source);
++            if (media_engine_source_is_current(engine, generation))
++                hr = media_engine_create_topology(engine, source, generation);
++            else
++                hr = MF_E_OPERATION_CANCELLED;
+             IMFMediaSource_Release(source);
+         }
++        if (!media_engine_source_is_current(engine, generation))
++            goto stale;
+         IUnknown_Release(object);
++        object = NULL;
+     }
+ 
++    /* media_engine_create_topology() may release engine->cs while the previous
++     * source drains.  Consume the current Play/Pause intent only after that
++     * window, rather than obeying a stale snapshot taken before it. */
++    start_playback = engine->playback_requested;
++    media_engine_set_flag(engine, FLAGS_ENGINE_SOURCE_PENDING | FLAGS_ENGINE_PLAY_PENDING, FALSE);
++
+     if (SUCCEEDED(hr))
+     {
+         engine->network_state = MF_MEDIA_ENGINE_NETWORK_IDLE;
+@@ -1685,6 +1841,11 @@ static HRESULT WINAPI media_engine_load_handler_Invoke(IMFAsyncCallback *iface,
+     LeaveCriticalSection(&engine->cs);
+ 
+     return S_OK;
++
++stale:
++    LeaveCriticalSection(&engine->cs);
++    media_engine_discard_source_object(object);
++    return S_OK;
+ }
+ 
+ static const IMFAsyncCallbackVtbl media_engine_load_handler_vtbl =
+@@ -1829,13 +1990,18 @@ static HRESULT WINAPI media_engine_SetSourceElements(IMFMediaEngineEx *iface, IM
+ 
+ static HRESULT media_engine_set_source(struct media_engine *engine, IMFByteStream *bytestream, BSTR url)
+ {
++    struct media_engine_load_context *context = NULL;
++    enum media_engine_load_origin origin;
+     IPropertyStore *props = NULL;
+     double previous_position = NAN;
+     BOOL start_pending;
+     unsigned int flags;
++    UINT64 generation;
+     HRESULT hr = S_OK;
+     MFTIME clocktime;
+ 
++    generation = ++engine->source_generation;
++
+     SysFreeString(engine->current_source);
+     engine->current_source = NULL;
+     if (url)
+@@ -1844,6 +2010,8 @@ static HRESULT media_engine_set_source(struct media_engine *engine, IMFByteStrea
+     engine->ready_state = MF_MEDIA_ENGINE_READY_HAVE_NOTHING;
+ 
+     IMFMediaEngineNotify_EventNotify(engine->callback, MF_MEDIA_ENGINE_EVENT_PURGEQUEUEDEVENTS, 0, 0);
++    if (!media_engine_source_is_current(engine, generation))
++        return S_OK;
+ 
+     if (isfinite(engine->deferred_seek))
+         previous_position = engine->deferred_seek;
+@@ -1855,6 +2023,7 @@ static HRESULT media_engine_set_source(struct media_engine *engine, IMFByteStrea
+         previous_position = mftime_to_seconds(clocktime);
+ 
+     start_pending = !(engine->flags & FLAGS_ENGINE_PAUSED) || (engine->flags & FLAGS_ENGINE_IS_ENDED);
++    engine->playback_requested = start_pending;
+ 
+     engine->network_state = MF_MEDIA_ENGINE_NETWORK_NO_SOURCE;
+     engine->video_frame.pts = MINLONGLONG;
+@@ -1881,15 +2050,34 @@ static HRESULT media_engine_set_source(struct media_engine *engine, IMFByteStrea
+     media_engine_set_flag(engine, FLAGS_ENGINE_SUPPRESS_INITIAL_SEEK,
+             isfinite(previous_position) && previous_position > 0.001);
+ 
++    if (!url && !bytestream)
++    {
++        engine->playback_requested = FALSE;
++        media_engine_set_flag(engine, FLAGS_ENGINE_SOURCE_PENDING | FLAGS_ENGINE_PLAY_PENDING, FALSE);
++        return S_OK;
++    }
++
+     if (url || bytestream)
+     {
+-        if (SUCCEEDED(hr))
+-            media_engine_set_flag(engine, FLAGS_ENGINE_SOURCE_PENDING, TRUE);
++        media_engine_set_flag(engine, FLAGS_ENGINE_SOURCE_PENDING, TRUE);
++
++        if (engine->extension)
++            origin = MEDIA_ENGINE_LOAD_EXTENSION;
++        else if (bytestream)
++            origin = MEDIA_ENGINE_LOAD_BYTESTREAM;
++        else
++            origin = MEDIA_ENGINE_LOAD_URL;
++
++        if (FAILED(hr = media_engine_load_context_create(origin, generation, bytestream, &context)))
++        {
++            media_engine_set_flag(engine, FLAGS_ENGINE_SOURCE_PENDING | FLAGS_ENGINE_PLAY_PENDING, FALSE);
++            return hr;
++        }
+ 
+         if (engine->extension)
+         {
+             hr = IMFMediaEngineExtension_BeginCreateObject(engine->extension, url, bytestream, MF_OBJECT_MEDIASOURCE, NULL,
+-                    &engine->load_handler, (IUnknown *)bytestream);
++                    &engine->load_handler, &context->IUnknown_iface);
+         }
+         else
+         {
+@@ -1901,14 +2089,20 @@ static HRESULT media_engine_set_source(struct media_engine *engine, IMFByteStrea
+                     &IID_IPropertyStore, (void **)&props);
+             if (bytestream)
+                 hr = IMFSourceResolver_BeginCreateObjectFromByteStream(engine->resolver, bytestream, url, flags,
+-                        props, NULL, &engine->load_handler, (IUnknown *)bytestream);
++                        props, NULL, &engine->load_handler, &context->IUnknown_iface);
+             else
+                 hr = IMFSourceResolver_BeginCreateObjectFromURL(engine->resolver, url, flags, props, NULL,
+-                        &engine->load_handler, NULL);
++                        &engine->load_handler, &context->IUnknown_iface);
+         }
+ 
+         if (props)
+             IPropertyStore_Release(props);
++        IUnknown_Release(&context->IUnknown_iface);
++
++        if (!media_engine_source_is_current(engine, generation))
++            return S_OK;
++        if (FAILED(hr))
++            media_engine_set_flag(engine, FLAGS_ENGINE_SOURCE_PENDING | FLAGS_ENGINE_PLAY_PENDING, FALSE);
+     }
+ 
+     return hr;
+@@ -2609,6 +2803,7 @@ static HRESULT WINAPI media_engine_Play(IMFMediaEngineEx *iface)
+         hr = MF_E_SHUTDOWN;
+     else
+     {
++        engine->playback_requested = TRUE;
+         IMFMediaEngineNotify_EventNotify(engine->callback, MF_MEDIA_ENGINE_EVENT_PURGEQUEUEDEVENTS, 0, 0);
+ 
+         if (!(engine->flags & FLAGS_ENGINE_WAITING))
+@@ -2655,6 +2850,7 @@ static HRESULT WINAPI media_engine_Pause(IMFMediaEngineEx *iface)
+         hr = MF_E_SHUTDOWN;
+     else
+     {
++        engine->playback_requested = FALSE;
+         if (engine->flags & FLAGS_ENGINE_PAUSE_PENDING)
+         {
+             media_engine_set_flag(engine, FLAGS_ENGINE_PLAY_PENDING, FALSE);
+diff --git a/dlls/winedmo/media_source.c b/dlls/winedmo/media_source.c
+--- a/dlls/winedmo/media_source.c
++++ b/dlls/winedmo/media_source.c
+@@ -110,6 +110,9 @@ static HRESULT object_context_create(DWORD flags, IMFByteStream *stream, const W
+     WCHAR *tmp_url = url ? wcsdup(url) : NULL;
+     struct object_context *context;
+ 
++    if (url && !tmp_url)
++        return E_OUTOFMEMORY;
++
+     if (!(context = calloc(1, sizeof(*context))))
+     {
+         free(tmp_url);

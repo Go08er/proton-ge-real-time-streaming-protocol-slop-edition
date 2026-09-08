@@ -1,0 +1,34 @@
+From 5806e8b9f34f1b0663b3017ef9dd1aa5d08116d1 Mon Sep 17 00:00:00 2001
+From: Michael Niedermayer <michael@niedermayer.cc>
+Date: Sat, 9 May 2026 00:00:00 +0000
+Subject: [PATCH 2/3] avcodec/magicyuv: Expand the s->interlaced slice-height
+ sanity check
+
+Fixes: poc_magicyuv.avi
+Fixes: out of array access
+
+Found-by: Ori Hollander of the JFrog Vulnerability Research team
+---
+ libavcodec/magicyuv.c | 8 ++++----
+ 1 file changed, 4 insertions(+), 4 deletions(-)
+
+diff --git a/libavcodec/magicyuv.c b/libavcodec/magicyuv.c
+index ea8a4007b6..aaff4df175 100644
+--- a/libavcodec/magicyuv.c
++++ b/libavcodec/magicyuv.c
+@@ -570,11 +570,11 @@ static int magy_decode_frame(AVCodecContext *avctx, AVFrame *p,
+         return AVERROR_INVALIDDATA;
+     }
+ 
++    if ((s->slice_height >> s->vshift[1]) <= s->interlaced) {
++        av_log(avctx, AV_LOG_ERROR, "impossible slice height\n");
++        return AVERROR_INVALIDDATA;
++    }
+     if (s->interlaced) {
+-        if ((s->slice_height >> s->vshift[1]) < 2) {
+-            av_log(avctx, AV_LOG_ERROR, "impossible slice height\n");
+-            return AVERROR_INVALIDDATA;
+-        }
+         if ((avctx->coded_height % s->slice_height) && ((avctx->coded_height % s->slice_height) >> s->vshift[1]) < 2) {
+             av_log(avctx, AV_LOG_ERROR, "impossible height\n");
+             return AVERROR_INVALIDDATA;

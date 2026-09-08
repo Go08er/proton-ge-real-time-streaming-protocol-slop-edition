@@ -1,0 +1,9 @@
+{
+  "last_modified": 1783522502,
+  "nar_hash_nix32": "0qnqll986cp3jzc3hw1nkld3w8jx2j3nk7rd4krd8s72rnbc1xw9",
+  "nar_hash_sri": "sha256-iffAls3iaNTyJC2faYcUXSI+Gp02cDjYl+MygxKl2GI=",
+  "owner": "nixos",
+  "repo": "nixpkgs",
+  "revision": "0bb7ec54c8483066ec9d7720e780a5caa71f8612",
+  "schema": 1
+}

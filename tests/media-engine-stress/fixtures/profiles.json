@@ -1,0 +1,154 @@
+{
+  "schema": 1,
+  "profiles": {
+    "smoke": {
+      "purpose": "Short deterministic fixtures for evaluator, CI, and VM smoke gates.",
+      "primary_duration_seconds": 8,
+      "topology_duration_seconds": 6,
+      "hls_duration_seconds": 8,
+      "matrix_duration_seconds": 4,
+      "width": 320,
+      "height": 180,
+      "frames_per_second": 30,
+      "audio_sample_rate": 48000,
+      "audio_channels": 2,
+      "gop_seconds": 1,
+      "delayed_track_seconds": 1.5,
+      "hls_segment_seconds": 2,
+      "hls_live_window_segments": 3
+    },
+    "full": {
+      "purpose": "VRChat game/VM qualification fixtures with useful seek and live-window depth.",
+      "primary_duration_seconds": 120,
+      "topology_duration_seconds": 60,
+      "hls_duration_seconds": 30,
+      "matrix_duration_seconds": 20,
+      "width": 1280,
+      "height": 720,
+      "frames_per_second": 30,
+      "audio_sample_rate": 48000,
+      "audio_channels": 2,
+      "gop_seconds": 1,
+      "delayed_track_seconds": 3,
+      "hls_segment_seconds": 2,
+      "hls_live_window_segments": 7
+    }
+  },
+  "rtsp_payload_ladder": {
+    "included_profiles": [
+      "full"
+    ],
+    "common": {
+      "duration_seconds": 45,
+      "frames_per_second": 30,
+      "gop_frames": 30,
+      "audio_codec": "aac",
+      "audio_bitrate_bps": 96000,
+      "audio_sample_rate": 48000,
+      "audio_channels": 2,
+      "pixel_format": "yuv420p",
+      "x264_preset": "medium",
+      "reference_frames": 3,
+      "b_frames": 2
+    },
+    "rungs": {
+      "a": {
+        "path": "rtsp/payload-a-320x180-main-270k.mp4",
+        "width": 320,
+        "height": 180,
+        "h264_profile": "Main",
+        "video_bitrate_bps": 270000
+      },
+      "b": {
+        "path": "rtsp/payload-b-1280x720-main-270k.mp4",
+        "width": 1280,
+        "height": 720,
+        "h264_profile": "Main",
+        "video_bitrate_bps": 270000
+      },
+      "c": {
+        "path": "rtsp/payload-c-1280x720-high-270k.mp4",
+        "width": 1280,
+        "height": 720,
+        "h264_profile": "High",
+        "video_bitrate_bps": 270000
+      },
+      "d": {
+        "path": "rtsp/payload-d-1280x720-high-8200k.mp4",
+        "width": 1280,
+        "height": 720,
+        "h264_profile": "High",
+        "video_bitrate_bps": 8200000
+      }
+    }
+  },
+  "rtsp_reproduction_inputs": {
+    "included_profiles": [
+      "full"
+    ],
+    "observed-heavy-v1": {
+      "path": "rtsp/repro-observed-heavy-v1.mp4",
+      "purpose": "Reproduce the exact media shape used by the in-game high-rate drain failure.",
+      "captured_reference_sha256": "8e2a8df84d9f257d3d0d3c24372ec644d9366cd9d734b284fe50d3b6a6346bde",
+      "duration_seconds": 45,
+      "width": 1280,
+      "height": 720,
+      "frames_per_second": 30,
+      "h264_profile": "High",
+      "video_bitrate_bps": 8000000,
+      "gop_frames": 60,
+      "reference_frames": 1,
+      "b_frames": 3,
+      "audio_codec": "aac",
+      "audio_bitrate_bps": 128000,
+      "audio_sample_rate": 48000,
+      "audio_channels": 2
+    },
+    "observed-midgop-v1": {
+      "path": "rtsp/repro-observed-midgop-v1.mp4",
+      "purpose": "Start the observed heavy input on a delta frame and require recovery at the next IDR.",
+      "derived_from": "observed-heavy-v1",
+      "trim_seconds": 0.5,
+      "duration_seconds": 44,
+      "first_keyframe_deadline_seconds": 1.6
+    }
+  },
+  "fixture_contract": {
+    "av/faststart.mp4": "H.264/AAC MP4 with moov before mdat",
+    "av/tail-moov.mp4": "the same encoded A/V timeline with moov after mdat",
+    "av/fragmented.mp4": "fragmented H.264/AAC MP4 with init metadata and moof fragments",
+    "topology/audio-only.m4a": "AAC stereo without a video stream",
+    "topology/video-only.mp4": "H.264 video without an audio stream",
+    "topology/delayed-audio.mp4": "video at zero and the first audio packet at the declared delay",
+    "topology/delayed-video.mp4": "audio at zero and the first video packet at the declared delay",
+    "hls/vod/index.m3u8": "finite deterministic MPEG-TS HLS with ENDLIST",
+    "hls/live/schedule.json": "ordered loopback-server inputs for advancing live windows",
+    "hls/vod-separate/master.m3u8": "finite master playlist with independent audio and video renditions",
+    "hls/live-separate/master.m3u8": "live master whose independent audio/video windows advance together",
+    "hls/live-separate/schedule.json": "hash-bound audio/video window pairs which a VM service publishes atomically",
+    "hls/cmaf/index.m3u8": "finite fragmented-MP4 HLS with an initialization map",
+    "rtsp/payload-a-320x180-main-270k.mp4": "45-second H.264 Main/AAC control near 0.37 Mbit/s total",
+    "rtsp/payload-b-1280x720-main-270k.mp4": "resolution-only step from payload A",
+    "rtsp/payload-c-1280x720-high-270k.mp4": "H.264-profile-only step from payload B",
+    "rtsp/payload-d-1280x720-high-8200k.mp4": "bitrate-only step from payload C near 8.3 Mbit/s total",
+    "rtsp/repro-observed-heavy-v1.mp4": "45-second reproduction of the observed 1280x720 High, two-second-GOP, three-B-frame input shape",
+    "rtsp/repro-observed-midgop-v1.mp4": "the observed heavy input trimmed to begin on a non-key video frame",
+    "discovery/containers": "same-track remuxes plus explicitly named format-native pairs",
+    "discovery/codecs": "short reference-discovery members for common Windows/web video codecs",
+    "discovery/audio": "44.1/48 kHz audio-only reference members plus 5.1 and multi-track inputs",
+    "invalid/not-media.bin": "non-media bytes",
+    "invalid/empty.bin": "zero-byte input",
+    "invalid/truncated-faststart.mp4": "parseable initialization followed by a truncated mdat",
+    "invalid/truncated-tail.mp4": "tail-moov MP4 cut before its metadata",
+    "invalid/missing-segment.m3u8": "valid-looking HLS playlist whose only child is absent",
+    "invalid/malformed.m3u8": "syntactically malformed HLS input"
+  },
+  "marker_contract": {
+    "video": "each frame overlays its zero-based frame number and FFmpeg PTS in hms form",
+    "audio_left": "continuous 173 Hz carrier plus a first-100-ms marker at 400 + 20 * second Hz",
+    "audio_right": "continuous 257 Hz carrier plus a first-100-ms marker at 3400 + 20 * second Hz",
+    "uniqueness": "marker frequencies do not repeat anywhere in the 120-second full profile",
+    "seek_video_tolerance_frames": 1,
+    "seek_audio_tolerance_milliseconds": 40
+  }
+}

@@ -1,0 +1,23 @@
+From 1b74aad16ec5db28a596e9e3f8b963bbb7691d6a Mon Sep 17 00:00:00 2001
+From: RTSP-on-GE design <rtsp-on-ge@example.invalid>
+Date: Sun, 26 Jul 2026 17:44:47 -0500
+Subject: [PATCH] winewayland.drv: advertise Wine VR device extensions
+
+Mirror the X11 device-extension mapper by exposing Wine's synthetic OpenVR
+and OpenXR device-extension requests through the native Wayland driver.
+
+A3.19: rebased after GE-Proton11-6's ge-video-rework set.
+---
+diff --git a/dlls/winewayland.drv/vulkan.c b/dlls/winewayland.drv/vulkan.c
+index 5cfb1c21513b9ecddb46e9226b0e7696d8e205d1..b1742a3a5ec48400042ae30495f9de54f29c627a 100644
+--- a/dlls/winewayland.drv/vulkan.c
++++ b/dlls/winewayland.drv/vulkan.c
+@@ -140,6 +140,8 @@ static void wayland_map_device_extensions(struct vulkan_device_extensions *exten
+     if (extensions->has_VK_KHR_external_semaphore_fd) extensions->has_VK_KHR_external_semaphore_win32 = 1;
+     if (extensions->has_VK_KHR_external_fence_win32) extensions->has_VK_KHR_external_fence_fd = 1;
+     if (extensions->has_VK_KHR_external_fence_fd) extensions->has_VK_KHR_external_fence_win32 = 1;
++    extensions->has_VK_WINE_openvr_device_extensions = 1;
++    extensions->has_VK_WINE_openxr_device_extensions = 1;
+ }
+ 
+ static VkColorSpaceKHR wayland_vulkan_map_colorspace(VkColorSpaceKHR colorspace, struct client_surface *client)

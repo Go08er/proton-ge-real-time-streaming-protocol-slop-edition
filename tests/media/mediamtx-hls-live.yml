@@ -1,0 +1,50 @@
+# SPDX-License-Identifier: BSD-3-Clause
+# Opt-in loopback-only HLS-live fixture. Do not replace loopback with a LAN binding.
+
+logLevel: info
+logDestinations: [stdout]
+readTimeout: 5s
+writeTimeout: 5s
+
+api: false
+metrics: false
+pprof: false
+playback: false
+
+rtsp: true
+rtspTransports: [tcp]
+rtspEncryption: "no"
+rtspAddress: 127.0.0.1:8554
+
+rtmp: false
+
+hls: true
+hlsAddress: 127.0.0.1:8888
+hlsEncryption: false
+hlsAllowOrigins: []
+hlsTrustedProxies: []
+hlsAlwaysRemux: true
+hlsVariant: mpegts
+hlsSegmentCount: 7
+hlsSegmentDuration: 2s
+hlsSegmentMaxSize: 50M
+hlsDirectory: ""
+hlsMuxerCloseAfter: 60s
+
+webrtc: false
+srt: false
+moq: false
+
+authInternalUsers:
+  - user: any
+    pass:
+    ips: ["127.0.0.1"]
+    permissions:
+      - action: publish
+        path: fixture
+      - action: read
+        path: fixture
+
+paths:
+  fixture:
+    source: publisher

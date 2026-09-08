@@ -1,0 +1,12 @@
+# SPDX-License-Identifier: BSD-3-Clause
+autoplay off
+load "http://127.0.0.1:18080/media?case=join-offset"
+# A late joiner receives the shared position before it starts playback.
+seek 47.250
+wait_event CANPLAY 15000
+wait_event SEEKED 15000
+play
+wait_event PLAYING 5000
+wait_time 48.250 10000
+snapshot "join-offset-steady"
+shutdown

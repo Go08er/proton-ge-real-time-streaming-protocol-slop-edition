@@ -1,0 +1,12 @@
+# SPDX-License-Identifier: BSD-3-Clause
+load "rtsp://10.0.2.2:8554/live/av"
+wait_event CANPLAY 20000
+play
+wait_event PLAYING 10000
+
+# Sample the entire window. A late burst cannot erase an earlier dropout.
+loop 8
+wait_ms 1000
+snapshot "live-steady"
+endloop
+shutdown

@@ -1,0 +1,5 @@
+driver_approval_version	1
+tag	GE-Proton11-3
+root_commit	8c8003f7f5473d883fbe1bc7ac070c79955754e8
+patch_driver_blob	8f8fe70781143614581d73a32dac84bdbb451694
+patch_driver_sha256	292ab1f0b653c5f9099f8870050e1803f392739a46790eb14b4cdb5162d7bcd6

@@ -1,0 +1,1919 @@
+From b3782cfb74b5d3e4af461772038a64e06b355415 Mon Sep 17 00:00:00 2001
+From: RTSP-on-GE design <rtsp-on-ge@example.invalid>
+Date: Tue, 14 Jul 2026 19:39:38 -0500
+Subject: [PATCH alpha 4/4] winedmo, mfmediaengine: stabilize asynchronous
+ media loading and VOD control
+
+Keep URLMon HTTP compatibility as a full-cache fallback, but move its blocking open to an MF I/O work item and preserve the cached stream length and position. Direct HLS remains on FFmpeg instead of redundantly fetching a manifest through URLMon. This does not claim incremental HTTP playback.
+
+Make source loading generation-aware and detach old presentations before lock-dropping shutdown. Preserve current play intent across asynchronous completion, discard stale results safely, and shut down live presentation state before releasing the media session.
+
+Use per-stream FIFO sample tokens with one logical worker, request generations, demux seek epochs, bounded queues, and one-shot EOS/EOP. Keep every active A/V stream primed before shared backpressure stops demuxing, so a full video queue cannot starve an empty audio queue.
+
+Coalesce running SetCurrentTimeEx updates, preserve GE synchronization suppression, and schedule one guaranteed final seek after 250 ms of quiet. Paused seeks remain immediate and scheduling failure falls back to a synchronous flush.
+
+Correct demux stream-index mapping, own late asynchronous read buffers, guard simple-buffer allocation overflow, use the MediaSource seek capability flag, propagate seek failures, and harden custom AVIO seek arithmetic, HLS deadlines, timestamp conversion, and teardown ordering.
+---
+ dlls/mfmediaengine/main.c   | 370 +++++++++++++++++---
+ dlls/winedmo/media_source.c | 654 +++++++++++++++++++++++++++++-------
+ dlls/winedmo/unix_demuxer.c |  16 +-
+ dlls/winedmo/unixlib.c      |  23 +-
+ 4 files changed, 888 insertions(+), 175 deletions(-)
+
+diff --git a/dlls/mfmediaengine/main.c b/dlls/mfmediaengine/main.c
+index c48f258..19a9ad8 100644
+--- a/dlls/mfmediaengine/main.c
++++ b/dlls/mfmediaengine/main.c
+@@ -142,6 +142,22 @@ struct effects
+     size_t capacity;
+ };
+ 
++enum media_engine_load_origin
++{
++    MEDIA_ENGINE_LOAD_EXTENSION,
++    MEDIA_ENGINE_LOAD_URL,
++    MEDIA_ENGINE_LOAD_BYTESTREAM,
++};
++
++struct media_engine_load_context
++{
++    IUnknown IUnknown_iface;
++    LONG refcount;
++    enum media_engine_load_origin origin;
++    UINT64 generation;
++    IMFByteStream *bytestream;
++};
++
+ struct media_engine
+ {
+     IMFMediaEngineEx IMFMediaEngineEx_iface;
+@@ -149,15 +165,19 @@ struct media_engine
+     IMFAsyncCallback session_events;
+     IMFAsyncCallback sink_events;
+     IMFAsyncCallback load_handler;
++    IMFAsyncCallback deferred_seek_callback;
+     LONG refcount;
+     IMFMediaEngineNotify *callback;
+     IMFAttributes *attributes;
+     IMFDXGIDeviceManager *device_manager;
+     HANDLE device_handle;
+     enum media_engine_mode mode;
++    UINT64 source_generation;
+     unsigned int flags;
+     double playback_rate;
+     double default_playback_rate;
++    BOOL playback_requested;
++    BOOL deferred_seek_work_scheduled;
+     double volume;
+     double duration;
+     double current_seek;
+@@ -817,6 +837,11 @@ static struct media_engine *impl_from_load_handler_IMFAsyncCallback(IMFAsyncCall
+     return CONTAINING_RECORD(iface, struct media_engine, load_handler);
+ }
+ 
++static struct media_engine *impl_from_deferred_seek_callback_IMFAsyncCallback(IMFAsyncCallback *iface)
++{
++    return CONTAINING_RECORD(iface, struct media_engine, deferred_seek_callback);
++}
++
+ static unsigned int get_gcd(unsigned int a, unsigned int b)
+ {
+     unsigned int m;
+@@ -1415,27 +1440,36 @@ static HRESULT media_engine_create_video_renderer(struct media_engine *engine, I
+     return hr;
+ }
+ 
++static BOOL media_engine_source_is_current(struct media_engine *engine, UINT64 generation)
++{
++    return !(engine->flags & FLAGS_ENGINE_SHUT_DOWN) && generation == engine->source_generation;
++}
++
+ /* must be called with engine->cs held */
+ static void media_engine_clear_presentation(struct media_engine *engine)
+ {
+-    if (engine->presentation.source)
++    IMFPresentationDescriptor *pd = engine->presentation.pd;
++    struct video_frame_sink *frame_sink = engine->presentation.frame_sink;
++    IMFMediaSource *source = engine->presentation.source;
++
++    /* Detach the old presentation before dropping the lock.  A concurrent
++     * source load may install a new presentation while Shutdown() drains its
++     * callbacks; the old cleanup must never release or clear that new state. */
++    memset(&engine->presentation, 0, sizeof(engine->presentation));
++
++    if (source)
+     {
+         /* critical section can not be held during shutdown, as shut down requires all pending
+          * callbacks to complete, and some callbacks require this cs */
+         LeaveCriticalSection(&engine->cs);
+-        IMFMediaSource_Shutdown(engine->presentation.source);
++        IMFMediaSource_Shutdown(source);
+         EnterCriticalSection(&engine->cs);
+-        IMFMediaSource_Release(engine->presentation.source);
++        IMFMediaSource_Release(source);
+     }
+-    if (engine->presentation.pd)
+-        IMFPresentationDescriptor_Release(engine->presentation.pd);
+-    if (engine->presentation.frame_sink)
+-    {
+-        video_frame_sink_release(engine->presentation.frame_sink);
+-        engine->presentation.frame_sink = NULL;
+-    }
+-
+-    memset(&engine->presentation, 0, sizeof(engine->presentation));
++    if (pd)
++        IMFPresentationDescriptor_Release(pd);
++    if (frame_sink)
++        video_frame_sink_release(frame_sink);
+ }
+ 
+ static void media_engine_clear_effects(struct effects *effects)
+@@ -1452,18 +1486,27 @@ static void media_engine_clear_effects(struct effects *effects)
+     memset(effects, 0, sizeof(*effects));
+ }
+ 
+-static HRESULT media_engine_create_topology(struct media_engine *engine, IMFMediaSource *source)
++static HRESULT media_engine_create_topology(struct media_engine *engine, IMFMediaSource *source, UINT64 generation)
+ {
+     IMFStreamDescriptor *sd_audio = NULL, *sd_video = NULL;
+     IMFPresentationDescriptor *pd;
+     DWORD stream_count = 0, i;
+-    IMFTopology *topology;
++    IMFTopology *topology = NULL;
+     UINT64 duration;
+     HRESULT hr;
+ 
++    if (!media_engine_source_is_current(engine, generation))
++        return MF_E_OPERATION_CANCELLED;
++
+     media_engine_release_video_frame_resources(engine);
+     media_engine_clear_presentation(engine);
+ 
++    /* media_engine_clear_presentation() drops engine->cs while the previous
++     * source shuts down.  Do not let an older callback replace a source that
++     * became current during that window. */
++    if (!media_engine_source_is_current(engine, generation))
++        return MF_E_OPERATION_CANCELLED;
++
+     if (FAILED(hr = IMFMediaSource_CreatePresentationDescriptor(source, &pd)))
+         return hr;
+ 
+@@ -1516,6 +1559,16 @@ static HRESULT media_engine_create_topology(struct media_engine *engine, IMFMedi
+         return E_UNEXPECTED;
+     }
+ 
++    if (!media_engine_source_is_current(engine, generation))
++    {
++        if (sd_video)
++            IMFStreamDescriptor_Release(sd_video);
++        if (sd_audio)
++            IMFStreamDescriptor_Release(sd_audio);
++        IMFPresentationDescriptor_Release(pd);
++        return MF_E_OPERATION_CANCELLED;
++    }
++
+     engine->presentation.source = source;
+     IMFMediaSource_AddRef(engine->presentation.source);
+     engine->presentation.pd = pd;
+@@ -1616,38 +1669,136 @@ static void media_engine_start_playback(struct media_engine *engine)
+     engine->presentation.start_position.vt = VT_EMPTY;
+ }
+ 
++static inline struct media_engine_load_context *impl_from_load_context_IUnknown(IUnknown *iface)
++{
++    return CONTAINING_RECORD(iface, struct media_engine_load_context, IUnknown_iface);
++}
++
++static HRESULT WINAPI media_engine_load_context_QueryInterface(IUnknown *iface, REFIID riid, void **obj)
++{
++    if (IsEqualIID(riid, &IID_IUnknown))
++    {
++        *obj = iface;
++        IUnknown_AddRef(iface);
++        return S_OK;
++    }
++
++    *obj = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI media_engine_load_context_AddRef(IUnknown *iface)
++{
++    struct media_engine_load_context *context = impl_from_load_context_IUnknown(iface);
++    return InterlockedIncrement(&context->refcount);
++}
++
++static ULONG WINAPI media_engine_load_context_Release(IUnknown *iface)
++{
++    struct media_engine_load_context *context = impl_from_load_context_IUnknown(iface);
++    ULONG refcount = InterlockedDecrement(&context->refcount);
++
++    if (!refcount)
++    {
++        if (context->bytestream)
++            IMFByteStream_Release(context->bytestream);
++        free(context);
++    }
++
++    return refcount;
++}
++
++static const IUnknownVtbl media_engine_load_context_vtbl =
++{
++    media_engine_load_context_QueryInterface,
++    media_engine_load_context_AddRef,
++    media_engine_load_context_Release,
++};
++
++static HRESULT media_engine_load_context_create(enum media_engine_load_origin origin, UINT64 generation,
++        IMFByteStream *bytestream, struct media_engine_load_context **out)
++{
++    struct media_engine_load_context *context;
++
++    if (!(context = calloc(1, sizeof(*context))))
++        return E_OUTOFMEMORY;
++
++    context->IUnknown_iface.lpVtbl = &media_engine_load_context_vtbl;
++    context->refcount = 1;
++    context->origin = origin;
++    context->generation = generation;
++    context->bytestream = bytestream;
++    if (context->bytestream)
++        IMFByteStream_AddRef(context->bytestream);
++
++    *out = context;
++    return S_OK;
++}
++
++static HRESULT media_engine_end_source_load(struct media_engine *engine, struct media_engine_load_context *context,
++        IMFAsyncResult *result, IUnknown **object)
++{
++    MF_OBJECT_TYPE obj_type;
++
++    switch (context->origin)
++    {
++        case MEDIA_ENGINE_LOAD_EXTENSION:
++            return IMFMediaEngineExtension_EndCreateObject(engine->extension, result, object);
++        case MEDIA_ENGINE_LOAD_URL:
++            return IMFSourceResolver_EndCreateObjectFromURL(engine->resolver, result, &obj_type, object);
++        case MEDIA_ENGINE_LOAD_BYTESTREAM:
++            return IMFSourceResolver_EndCreateObjectFromByteStream(engine->resolver, result, &obj_type, object);
++        default:
++            return E_UNEXPECTED;
++    }
++}
++
++static void media_engine_discard_source_object(IUnknown *object)
++{
++    IMFMediaSource *source;
++    HRESULT hr;
++
++    if (!object)
++        return;
++
++    if (SUCCEEDED(IUnknown_QueryInterface(object, &IID_IMFMediaSource, (void **)&source)))
++    {
++        if (FAILED(hr = IMFMediaSource_Shutdown(source)))
++            WARN("Failed to shut down discarded media source, hr %#lx.\n", hr);
++        IMFMediaSource_Release(source);
++    }
++    IUnknown_Release(object);
++}
++
+ static HRESULT WINAPI media_engine_load_handler_Invoke(IMFAsyncCallback *iface, IMFAsyncResult *result)
+ {
+     struct media_engine *engine = impl_from_load_handler_IMFAsyncCallback(iface);
+-    IUnknown *object = NULL, *state;
++    struct media_engine_load_context *context;
++    IUnknown *object = NULL, *state = NULL;
+     unsigned int start_playback;
+-    MF_OBJECT_TYPE obj_type;
+     IMFMediaSource *source;
++    UINT64 generation;
+     HRESULT hr;
+ 
+-    EnterCriticalSection(&engine->cs);
+-
+-    if (engine->flags & FLAGS_ENGINE_SHUT_DOWN)
++    if (FAILED(hr = IMFAsyncResult_GetState(result, &state)))
+     {
+-        LeaveCriticalSection(&engine->cs);
++        WARN("Source load result has no context, hr %#lx.\n", hr);
+         return S_OK;
+     }
+ 
+-    engine->network_state = MF_MEDIA_ENGINE_NETWORK_LOADING;
+-    IMFMediaEngineNotify_EventNotify(engine->callback, MF_MEDIA_ENGINE_EVENT_LOADSTART, 0, 0);
++    context = impl_from_load_context_IUnknown(state);
++    hr = media_engine_end_source_load(engine, context, result, &object);
++    generation = context->generation;
++    IUnknown_Release(state);
+ 
+-    start_playback = (engine->flags & FLAGS_ENGINE_PLAY_PENDING) || !(engine->flags & FLAGS_ENGINE_PAUSED);
+-    media_engine_set_flag(engine, FLAGS_ENGINE_SOURCE_PENDING | FLAGS_ENGINE_PLAY_PENDING, FALSE);
++    EnterCriticalSection(&engine->cs);
++    if (!media_engine_source_is_current(engine, generation))
++        goto stale;
+ 
+-    if (engine->extension)
+-        hr = IMFMediaEngineExtension_EndCreateObject(engine->extension, result, &object);
+-    else if (SUCCEEDED(IMFAsyncResult_GetState(result, &state)))
+-    {
+-        hr = IMFSourceResolver_EndCreateObjectFromByteStream(engine->resolver, result, &obj_type, &object);
+-        IUnknown_Release(state);
+-    }
+-    else
+-        hr = IMFSourceResolver_EndCreateObjectFromURL(engine->resolver, result, &obj_type, &object);
++    engine->network_state = MF_MEDIA_ENGINE_NETWORK_LOADING;
++    IMFMediaEngineNotify_EventNotify(engine->callback, MF_MEDIA_ENGINE_EVENT_LOADSTART, 0, 0);
++    if (!media_engine_source_is_current(engine, generation))
++        goto stale;
+ 
+     if (FAILED(hr))
+         WARN("Failed to create source object, hr %#lx.\n", hr);
+@@ -1656,12 +1807,24 @@ static HRESULT WINAPI media_engine_load_handler_Invoke(IMFAsyncCallback *iface,
+     {
+         if (SUCCEEDED(hr = IUnknown_QueryInterface(object, &IID_IMFMediaSource, (void **)&source)))
+         {
+-            hr = media_engine_create_topology(engine, source);
++            if (media_engine_source_is_current(engine, generation))
++                hr = media_engine_create_topology(engine, source, generation);
++            else
++                hr = MF_E_OPERATION_CANCELLED;
+             IMFMediaSource_Release(source);
+         }
++        if (!media_engine_source_is_current(engine, generation))
++            goto stale;
+         IUnknown_Release(object);
++        object = NULL;
+     }
+ 
++    /* media_engine_create_topology() may release engine->cs while the previous
++     * source drains.  Consume the current Play/Pause intent only after that
++     * window, rather than obeying a stale snapshot taken before it. */
++    start_playback = engine->playback_requested;
++    media_engine_set_flag(engine, FLAGS_ENGINE_SOURCE_PENDING | FLAGS_ENGINE_PLAY_PENDING, FALSE);
++
+     if (SUCCEEDED(hr))
+     {
+         engine->network_state = MF_MEDIA_ENGINE_NETWORK_IDLE;
+@@ -1685,6 +1848,11 @@ static HRESULT WINAPI media_engine_load_handler_Invoke(IMFAsyncCallback *iface,
+     LeaveCriticalSection(&engine->cs);
+ 
+     return S_OK;
++
++stale:
++    LeaveCriticalSection(&engine->cs);
++    media_engine_discard_source_object(object);
++    return S_OK;
+ }
+ 
+ static const IMFAsyncCallbackVtbl media_engine_load_handler_vtbl =
+@@ -1735,6 +1903,20 @@ static ULONG WINAPI media_engine_AddRef(IMFMediaEngineEx *iface)
+ 
+ static void free_media_engine(struct media_engine *engine)
+ {
++    BOOL shutdown_session;
++
++    EnterCriticalSection(&engine->cs);
++    shutdown_session = !(engine->flags & FLAGS_ENGINE_SHUT_DOWN);
++    if (shutdown_session)
++        media_engine_set_flag(engine, FLAGS_ENGINE_SHUT_DOWN, TRUE);
++    media_engine_clear_presentation(engine);
++    LeaveCriticalSection(&engine->cs);
++
++    /* Keep the session alive until its sources and pending callbacks have been
++     * shut down.  Explicit Shutdown() already performs this step. */
++    if (shutdown_session && engine->session)
++        IMFMediaSession_Shutdown(engine->session);
++
+     if (engine->callback)
+         IMFMediaEngineNotify_Release(engine->callback);
+     if (engine->clock)
+@@ -1750,7 +1932,6 @@ static void free_media_engine(struct media_engine *engine)
+     media_engine_clear_effects(&engine->audio_effects);
+     media_engine_clear_effects(&engine->video_effects);
+     media_engine_release_video_frame_resources(engine);
+-    media_engine_clear_presentation(engine);
+     if (engine->device_manager)
+     {
+         IMFDXGIDeviceManager_CloseDeviceHandle(engine->device_manager, engine->device_handle);
+@@ -1829,13 +2010,18 @@ static HRESULT WINAPI media_engine_SetSourceElements(IMFMediaEngineEx *iface, IM
+ 
+ static HRESULT media_engine_set_source(struct media_engine *engine, IMFByteStream *bytestream, BSTR url)
+ {
++    struct media_engine_load_context *context = NULL;
++    enum media_engine_load_origin origin;
+     IPropertyStore *props = NULL;
+     double previous_position = NAN;
+     BOOL start_pending;
+     unsigned int flags;
++    UINT64 generation;
+     HRESULT hr = S_OK;
+     MFTIME clocktime;
+ 
++    generation = ++engine->source_generation;
++
+     SysFreeString(engine->current_source);
+     engine->current_source = NULL;
+     if (url)
+@@ -1844,6 +2030,8 @@ static HRESULT media_engine_set_source(struct media_engine *engine, IMFByteStrea
+     engine->ready_state = MF_MEDIA_ENGINE_READY_HAVE_NOTHING;
+ 
+     IMFMediaEngineNotify_EventNotify(engine->callback, MF_MEDIA_ENGINE_EVENT_PURGEQUEUEDEVENTS, 0, 0);
++    if (!media_engine_source_is_current(engine, generation))
++        return S_OK;
+ 
+     if (isfinite(engine->deferred_seek))
+         previous_position = engine->deferred_seek;
+@@ -1855,6 +2043,7 @@ static HRESULT media_engine_set_source(struct media_engine *engine, IMFByteStrea
+         previous_position = mftime_to_seconds(clocktime);
+ 
+     start_pending = !(engine->flags & FLAGS_ENGINE_PAUSED) || (engine->flags & FLAGS_ENGINE_IS_ENDED);
++    engine->playback_requested = start_pending;
+ 
+     engine->network_state = MF_MEDIA_ENGINE_NETWORK_NO_SOURCE;
+     engine->video_frame.pts = MINLONGLONG;
+@@ -1881,15 +2070,34 @@ static HRESULT media_engine_set_source(struct media_engine *engine, IMFByteStrea
+     media_engine_set_flag(engine, FLAGS_ENGINE_SUPPRESS_INITIAL_SEEK,
+             isfinite(previous_position) && previous_position > 0.001);
+ 
++    if (!url && !bytestream)
++    {
++        engine->playback_requested = FALSE;
++        media_engine_set_flag(engine, FLAGS_ENGINE_SOURCE_PENDING | FLAGS_ENGINE_PLAY_PENDING, FALSE);
++        return S_OK;
++    }
++
+     if (url || bytestream)
+     {
+-        if (SUCCEEDED(hr))
+-            media_engine_set_flag(engine, FLAGS_ENGINE_SOURCE_PENDING, TRUE);
++        media_engine_set_flag(engine, FLAGS_ENGINE_SOURCE_PENDING, TRUE);
++
++        if (engine->extension)
++            origin = MEDIA_ENGINE_LOAD_EXTENSION;
++        else if (bytestream)
++            origin = MEDIA_ENGINE_LOAD_BYTESTREAM;
++        else
++            origin = MEDIA_ENGINE_LOAD_URL;
++
++        if (FAILED(hr = media_engine_load_context_create(origin, generation, bytestream, &context)))
++        {
++            media_engine_set_flag(engine, FLAGS_ENGINE_SOURCE_PENDING | FLAGS_ENGINE_PLAY_PENDING, FALSE);
++            return hr;
++        }
+ 
+         if (engine->extension)
+         {
+             hr = IMFMediaEngineExtension_BeginCreateObject(engine->extension, url, bytestream, MF_OBJECT_MEDIASOURCE, NULL,
+-                    &engine->load_handler, (IUnknown *)bytestream);
++                    &engine->load_handler, &context->IUnknown_iface);
+         }
+         else
+         {
+@@ -1901,14 +2109,20 @@ static HRESULT media_engine_set_source(struct media_engine *engine, IMFByteStrea
+                     &IID_IPropertyStore, (void **)&props);
+             if (bytestream)
+                 hr = IMFSourceResolver_BeginCreateObjectFromByteStream(engine->resolver, bytestream, url, flags,
+-                        props, NULL, &engine->load_handler, (IUnknown *)bytestream);
++                        props, NULL, &engine->load_handler, &context->IUnknown_iface);
+             else
+                 hr = IMFSourceResolver_BeginCreateObjectFromURL(engine->resolver, url, flags, props, NULL,
+-                        &engine->load_handler, NULL);
++                        &engine->load_handler, &context->IUnknown_iface);
+         }
+ 
+         if (props)
+             IPropertyStore_Release(props);
++        IUnknown_Release(&context->IUnknown_iface);
++
++        if (!media_engine_source_is_current(engine, generation))
++            return S_OK;
++        if (FAILED(hr))
++            media_engine_set_flag(engine, FLAGS_ENGINE_SOURCE_PENDING | FLAGS_ENGINE_PLAY_PENDING, FALSE);
+     }
+ 
+     return hr;
+@@ -2297,10 +2511,78 @@ static HRESULT media_engine_flush_deferred_seek(struct media_engine *engine)
+     return media_engine_set_current_time(engine, seektime);
+ }
+ 
++static HRESULT media_engine_schedule_deferred_seek(struct media_engine *engine, DWORD delay)
++{
++    HRESULT hr;
++
++    if (engine->deferred_seek_work_scheduled)
++        return S_OK;
++
++    if (!delay)
++        delay = 1;
++    hr = MFScheduleWorkItem(&engine->deferred_seek_callback, NULL, -(INT64)delay, NULL);
++    if (SUCCEEDED(hr))
++        engine->deferred_seek_work_scheduled = TRUE;
++    else
++    {
++        WARN("Failed to schedule deferred seek, hr %#lx; flushing synchronously.\n", hr);
++        hr = media_engine_flush_deferred_seek(engine);
++    }
++
++    return hr;
++}
++
++static ULONG WINAPI media_engine_deferred_seek_callback_AddRef(IMFAsyncCallback *iface)
++{
++    struct media_engine *engine = impl_from_deferred_seek_callback_IMFAsyncCallback(iface);
++    return IMFMediaEngineEx_AddRef(&engine->IMFMediaEngineEx_iface);
++}
++
++static ULONG WINAPI media_engine_deferred_seek_callback_Release(IMFAsyncCallback *iface)
++{
++    struct media_engine *engine = impl_from_deferred_seek_callback_IMFAsyncCallback(iface);
++    return IMFMediaEngineEx_Release(&engine->IMFMediaEngineEx_iface);
++}
++
++static HRESULT WINAPI media_engine_deferred_seek_callback_Invoke(IMFAsyncCallback *iface, IMFAsyncResult *result)
++{
++    struct media_engine *engine = impl_from_deferred_seek_callback_IMFAsyncCallback(iface);
++    DWORD elapsed;
++    HRESULT hr = S_OK;
++
++    EnterCriticalSection(&engine->cs);
++    engine->deferred_seek_work_scheduled = FALSE;
++
++    if (!(engine->flags & FLAGS_ENGINE_SHUT_DOWN) && (engine->flags & FLAGS_ENGINE_DEFERRED_SEEK))
++    {
++        elapsed = GetTickCount() - engine->deferred_seek_time;
++        if (elapsed < 250)
++            hr = media_engine_schedule_deferred_seek(engine, 250 - elapsed);
++        else
++            hr = media_engine_flush_deferred_seek(engine);
++
++        if (FAILED(hr))
++            WARN("Failed to flush deferred seek, hr %#lx.\n", hr);
++    }
++
++    LeaveCriticalSection(&engine->cs);
++    return S_OK;
++}
++
++static const IMFAsyncCallbackVtbl media_engine_deferred_seek_callback_vtbl =
++{
++    media_engine_callback_QueryInterface,
++    media_engine_deferred_seek_callback_AddRef,
++    media_engine_deferred_seek_callback_Release,
++    media_engine_callback_GetParameters,
++    media_engine_deferred_seek_callback_Invoke,
++};
++
+ static HRESULT media_engine_defer_current_time(struct media_engine *engine, double seektime)
+ {
+     MFTIME clocktime;
+     double current;
++    HRESULT hr;
+ 
+     if ((engine->flags & FLAGS_ENGINE_SOURCE_PENDING) || !engine->presentation.pd)
+         return S_OK;
+@@ -2350,9 +2632,10 @@ static HRESULT media_engine_defer_current_time(struct media_engine *engine, doub
+     engine->deferred_seek = seektime;
+     engine->deferred_seek_time = GetTickCount();
+     media_engine_set_flag(engine, FLAGS_ENGINE_DEFERRED_SEEK, TRUE);
++    hr = media_engine_schedule_deferred_seek(engine, 250);
+     IMFMediaEngineNotify_EventNotify(engine->callback, MF_MEDIA_ENGINE_EVENT_TIMEUPDATE, 0, 0);
+ 
+-    return S_OK;
++    return hr;
+ }
+ 
+ static HRESULT WINAPI media_engine_SetCurrentTime(IMFMediaEngineEx *iface, double time)
+@@ -2512,7 +2795,7 @@ static HRESULT WINAPI media_engine_GetSeekable(IMFMediaEngineEx *iface, IMFMedia
+         if (SUCCEEDED(hr) && !isnan(engine->duration) && engine->presentation.source)
+         {
+             hr = IMFMediaSource_GetCharacteristics(engine->presentation.source, &flags);
+-            if (SUCCEEDED(hr) && (flags & MFBYTESTREAM_IS_SEEKABLE))
++            if (SUCCEEDED(hr) && (flags & MFMEDIASOURCE_CAN_SEEK))
+                 hr = IMFMediaTimeRange_AddRange(time_range, 0.0, engine->duration);
+         }
+     }
+@@ -2609,6 +2892,7 @@ static HRESULT WINAPI media_engine_Play(IMFMediaEngineEx *iface)
+         hr = MF_E_SHUTDOWN;
+     else
+     {
++        engine->playback_requested = TRUE;
+         IMFMediaEngineNotify_EventNotify(engine->callback, MF_MEDIA_ENGINE_EVENT_PURGEQUEUEDEVENTS, 0, 0);
+ 
+         if (!(engine->flags & FLAGS_ENGINE_WAITING))
+@@ -2655,6 +2939,7 @@ static HRESULT WINAPI media_engine_Pause(IMFMediaEngineEx *iface)
+         hr = MF_E_SHUTDOWN;
+     else
+     {
++        engine->playback_requested = FALSE;
+         if (engine->flags & FLAGS_ENGINE_PAUSE_PENDING)
+         {
+             media_engine_set_flag(engine, FLAGS_ENGINE_PLAY_PENDING, FALSE);
+@@ -4050,6 +4335,7 @@ static HRESULT init_media_engine(DWORD flags, IMFAttributes *attributes, struct
+     engine->session_events.lpVtbl = &media_engine_session_events_vtbl;
+     engine->sink_events.lpVtbl = &media_engine_sink_events_vtbl;
+     engine->load_handler.lpVtbl = &media_engine_load_handler_vtbl;
++    engine->deferred_seek_callback.lpVtbl = &media_engine_deferred_seek_callback_vtbl;
+     engine->refcount = 1;
+     engine->flags = (flags & MF_MEDIA_ENGINE_CREATEFLAGS_MASK) | FLAGS_ENGINE_PAUSED;
+     engine->default_playback_rate = 1.0;
+diff --git a/dlls/winedmo/media_source.c b/dlls/winedmo/media_source.c
+index 7552ce9..4a7db78 100644
+--- a/dlls/winedmo/media_source.c
++++ b/dlls/winedmo/media_source.c
+@@ -110,6 +110,9 @@ static HRESULT object_context_create(DWORD flags, IMFByteStream *stream, const W
+     WCHAR *tmp_url = url ? wcsdup(url) : NULL;
+     struct object_context *context;
+ 
++    if (url && !tmp_url)
++        return E_OUTOFMEMORY;
++
+     if (!(context = calloc(1, sizeof(*context))))
+     {
+         free(tmp_url);
+@@ -209,7 +212,12 @@ static const IMediaBufferVtbl simple_buffer_vtbl =
+ 
+ static struct simple_buffer *simple_buffer_create(ULONG size)
+ {
+-    struct simple_buffer *buf = malloc(offsetof(struct simple_buffer, data[size]));
++    SIZE_T header_size = offsetof(struct simple_buffer, data);
++    struct simple_buffer *buf;
++
++    if ((SIZE_T)size > SIZE_MAX - header_size)
++        return NULL;
++    buf = malloc(header_size + size);
+     if (!buf) return NULL;
+     buf->IMediaBuffer_iface.lpVtbl = &simple_buffer_vtbl;
+     buf->refcount = 1;
+@@ -227,6 +235,7 @@ struct media_packet
+     struct list entry;
+     BYTE *data;
+     UINT32 size;
++    LONG epoch;
+     INT64 dts;      /* INT64_MIN if unavailable */
+     INT64 pts;      /* INT64_MIN if unavailable */
+     INT64 duration; /* INT64_MIN if unavailable */
+@@ -270,7 +279,12 @@ struct media_stream
+ 
+     DWORD stream_id;
+     BOOL active;
++    BOOL paused;
+     BOOL eos;
++    LONG eos_epoch;
++    BOOL eos_sent;
++    BOOL sample_worker_pending;
++    LONG request_generation;
+     UINT queued_packets;
+     UINT64 queued_bytes;
+ };
+@@ -312,6 +326,7 @@ struct source_async_command
+         {
+             struct media_stream *stream;
+             IUnknown *token;
++            LONG generation;
+         } request_sample;
+     } u;
+ };
+@@ -326,6 +341,7 @@ struct media_source
+     IMFAsyncCallback async_commands_callback;
+     LONG ref;
+     DWORD async_commands_queue;
++    DWORD sample_requests_queue;
+     IMFMediaEventQueue *event_queue;
+     IMFByteStream *byte_stream;
+ 
+@@ -333,6 +349,8 @@ struct media_source
+ 
+     CRITICAL_SECTION cs;
+     CRITICAL_SECTION demuxer_cs;
++    CONDITION_VARIABLE work_cv;
++    LONG pending_work_items;
+ 
+     UINT64 file_size;
+     UINT64 stream_offset;
+@@ -348,11 +366,13 @@ struct media_source
+     } demuxer_stream;
+ 
+     HANDLE demux_thread;
++    LONG demux_transition_epoch;
+     bool demux_thread_shutdown;
+     bool read_flushing;
+     bool flushing;
+     bool demux_eof;
+     bool eop_queued;
++    HRESULT demux_terminal_error;
+ 
+     IMFStreamDescriptor **descriptors;
+     struct media_stream **streams;
+@@ -383,6 +403,43 @@ static inline struct media_source *impl_from_IMFMediaSource(IMFMediaSource *ifac
+     return CONTAINING_RECORD(iface, struct media_source, IMFMediaSource_iface);
+ }
+ 
++static struct media_stream *media_source_find_stream(struct media_source *source,
++        UINT demux_index, UINT *source_index)
++{
++    UINT i;
++
++    for (i = 0; i < source->stream_count; i++)
++    {
++        if (source->streams[i]->stream_index != demux_index)
++            continue;
++        if (source_index)
++            *source_index = i;
++        return source->streams[i];
++    }
++    return NULL;
++}
++
++static LONG media_source_begin_demux_transition(struct media_source *source)
++{
++    LONG epoch = InterlockedCompareExchange(&source->demux_transition_epoch, 0, 0);
++
++    if (!(epoch & 1))
++        epoch = InterlockedIncrement(&source->demux_transition_epoch);
++    return epoch;
++}
++
++static void media_source_end_demux_transition(struct media_source *source)
++{
++    LONG epoch = InterlockedIncrement(&source->demux_transition_epoch);
++
++    assert(!(epoch & 1));
++}
++
++static LONG media_source_get_demux_transition(struct media_source *source)
++{
++    return InterlockedCompareExchange(&source->demux_transition_epoch, 0, 0);
++}
++
+ static inline struct media_source *impl_from_IMFGetService(IMFGetService *iface)
+ {
+     return CONTAINING_RECORD(iface, struct media_source, IMFGetService_iface);
+@@ -418,6 +475,7 @@ static HRESULT media_stream_send_eos(struct media_source *source, struct media_s
+ static BOOL media_source_stream_queues_full(struct media_source *source)
+ {
+     UINT i;
++    BOOL any_active = FALSE;
+     BOOL primed = TRUE;
+     BOOL any_full = FALSE;
+ 
+@@ -427,10 +485,13 @@ static BOOL media_source_stream_queues_full(struct media_source *source)
+         BOOL full;
+         BOOL empty;
+ 
++        EnterCriticalSection(&stream->queue_cs);
+         if (!stream->active || stream->eos)
++        {
++            LeaveCriticalSection(&stream->queue_cs);
+             continue;
+-
+-        EnterCriticalSection(&stream->queue_cs);
++        }
++        any_active = TRUE;
+         empty = !stream->queued_packets;
+         full = stream->queued_packets >= MEDIA_SOURCE_MAX_QUEUED_PACKETS
+                 || stream->queued_bytes >= MEDIA_SOURCE_MAX_QUEUED_BYTES;
+@@ -438,12 +499,11 @@ static BOOL media_source_stream_queues_full(struct media_source *source)
+ 
+         if (empty)
+             primed = FALSE;
+-
+         if (full)
+             any_full = TRUE;
+     }
+ 
+-    return primed && any_full;
++    return !any_active || (primed && any_full);
+ }
+ 
+ /* ========================================================================
+@@ -515,6 +575,22 @@ static HRESULT source_create_async_op(enum source_async_op op, IUnknown **out)
+     return S_OK;
+ }
+ 
++/* source->cs serializes submission against Shutdown.  Count both control and
++ * sample work because unlocking an MF work queue does not drain queued items. */
++static HRESULT source_submit_work_item(struct media_source *source, DWORD queue, IUnknown *op)
++{
++    HRESULT hr;
++
++    ++source->pending_work_items;
++    hr = MFPutWorkItem(queue, &source->async_commands_callback, op);
++    if (FAILED(hr))
++    {
++        --source->pending_work_items;
++        WakeAllConditionVariable(&source->work_cv);
++    }
++    return hr;
++}
++
+ /* ========================================================================
+  * async_commands_callback boilerplate
+  * ======================================================================== */
+@@ -577,38 +653,82 @@ static BOOL enqueue_token(struct media_stream *stream, IUnknown *token)
+     return TRUE;
+ }
+ 
+-static void flush_token_queue(struct media_stream *stream, BOOL send)
++static BOOL prepend_token(struct media_stream *stream, IUnknown *token)
++{
++    if (stream->token_queue_count == stream->token_queue_cap)
++    {
++        IUnknown **buf;
++        LONG cap = stream->token_queue_cap * 2 + 1;
++
++        if (!(buf = realloc(stream->token_queue, cap * sizeof(*buf))))
++            return FALSE;
++        stream->token_queue = buf;
++        stream->token_queue_cap = cap;
++    }
++
++    memmove(stream->token_queue + 1, stream->token_queue,
++            stream->token_queue_count * sizeof(*stream->token_queue));
++    stream->token_queue[0] = token;
++    ++stream->token_queue_count;
++    return TRUE;
++}
++
++static BOOL dequeue_token(struct media_stream *stream, IUnknown **token)
++{
++    if (!stream->token_queue_count)
++        return FALSE;
++
++    *token = stream->token_queue[0];
++    --stream->token_queue_count;
++    memmove(stream->token_queue, stream->token_queue + 1,
++            stream->token_queue_count * sizeof(*stream->token_queue));
++    return TRUE;
++}
++
++static void flush_token_queue(struct media_stream *stream, BOOL send);
++
++static HRESULT schedule_sample_worker(struct media_stream *stream)
+ {
+     struct media_source *source = impl_from_IMFMediaSource(stream->media_source);
++    struct source_async_command *command;
++    IUnknown *op;
++    HRESULT hr;
++
++    if (stream->sample_worker_pending || !stream->token_queue_count || !stream->active
++            || source->state != SOURCE_RUNNING)
++        return S_OK;
++
++    if (FAILED(hr = source_create_async_op(SOURCE_ASYNC_REQUEST_SAMPLE, &op)))
++        return hr;
++
++    command = impl_from_async_command_IUnknown(op);
++    command->u.request_sample.stream = stream;
++    command->u.request_sample.generation = stream->request_generation;
++    stream->sample_worker_pending = TRUE;
++    hr = source_submit_work_item(source, source->sample_requests_queue, op);
++    if (FAILED(hr))
++        stream->sample_worker_pending = FALSE;
++    IUnknown_Release(op);
++    return hr;
++}
++
++static void flush_token_queue(struct media_stream *stream, BOOL send)
++{
+     LONG i;
+ 
+-    for (i = 0; i < stream->token_queue_count; i++)
++    if (send && stream->token_queue_count)
+     {
+-        if (send)
+-        {
+-            IUnknown *op;
+-            HRESULT hr;
++        HRESULT hr = schedule_sample_worker(stream);
+ 
+-            if (SUCCEEDED(hr = source_create_async_op(SOURCE_ASYNC_REQUEST_SAMPLE, &op)))
+-            {
+-                struct source_async_command *command = impl_from_async_command_IUnknown(op);
+-                command->u.request_sample.stream = stream;
+-                command->u.request_sample.token = stream->token_queue[i];
+-
+-                /* SOURCE_ASYNC_REQUEST_SAMPLE can block in wait_on_sample().
+-                 * Do not serialize those waits on the private command queue used
+-                 * for source start/stop/pause, or one stream's requests can starve
+-                 * another stream during clip transitions. */
+-                hr = MFPutWorkItem(MFASYNC_CALLBACK_QUEUE_STANDARD,
+-                        &source->async_commands_callback, op);
+-                IUnknown_Release(op);
+-            }
+-            if (FAILED(hr))
+-                WARN("Could not enqueue sample request, hr %#lx\n", hr);
+-        }
+-        else if (stream->token_queue[i])
+-            IUnknown_Release(stream->token_queue[i]);
++        if (FAILED(hr))
++            WARN("Could not enqueue sample request worker, hr %#lx\n", hr);
++        else
++            return;
+     }
++
++    for (i = 0; i < stream->token_queue_count; i++)
++        if (stream->token_queue[i])
++            IUnknown_Release(stream->token_queue[i]);
+     free(stream->token_queue);
+     stream->token_queue = NULL;
+     stream->token_queue_count = 0;
+@@ -624,7 +744,10 @@ struct winedmo_bytestream_read_cb
+     IMFAsyncCallback IMFAsyncCallback_iface;
+     LONG refcount;
+     HANDLE event;
+-    IMFAsyncResult *result;
++    IMFByteStream *stream;
++    BYTE *buffer;
++    ULONG read_size;
++    HRESULT status;
+ };
+ 
+ static struct winedmo_bytestream_read_cb *winedmo_bytestream_read_cb_from_iface(IMFAsyncCallback *iface)
+@@ -653,7 +776,13 @@ static ULONG WINAPI winedmo_bytestream_read_cb_Release(IMFAsyncCallback *iface)
+ {
+     struct winedmo_bytestream_read_cb *cb = winedmo_bytestream_read_cb_from_iface(iface);
+     ULONG ref = InterlockedDecrement(&cb->refcount);
+-    if (!ref) { CloseHandle(cb->event); free(cb); }
++    if (!ref)
++    {
++        IMFByteStream_Release(cb->stream);
++        CloseHandle(cb->event);
++        free(cb->buffer);
++        free(cb);
++    }
+     return ref;
+ }
+ 
+@@ -665,8 +794,8 @@ static HRESULT WINAPI winedmo_bytestream_read_cb_GetParameters(IMFAsyncCallback
+ static HRESULT WINAPI winedmo_bytestream_read_cb_Invoke(IMFAsyncCallback *iface, IMFAsyncResult *result)
+ {
+     struct winedmo_bytestream_read_cb *cb = winedmo_bytestream_read_cb_from_iface(iface);
+-    cb->result = result;
+-    IMFAsyncResult_AddRef(result);
++
++    cb->status = IMFByteStream_EndRead(cb->stream, result, &cb->read_size);
+     SetEvent(cb->event);
+     return S_OK;
+ }
+@@ -686,7 +815,7 @@ static const IMFAsyncCallbackVtbl winedmo_bytestream_read_cb_vtbl =
+ static HRESULT winedmo_bytestream_read(IMFByteStream *stream, BYTE *buffer, ULONG size, ULONG *read_size)
+ {
+     struct winedmo_bytestream_read_cb *cb;
+-    IMFAsyncResult *result;
++    DWORD wait;
+     HRESULT hr;
+ 
+     if (FAILED(hr = IMFByteStream_Read(stream, buffer, size, read_size)))
+@@ -698,25 +827,43 @@ static HRESULT winedmo_bytestream_read(IMFByteStream *stream, BYTE *buffer, ULON
+         return E_OUTOFMEMORY;
+     cb->IMFAsyncCallback_iface.lpVtbl = &winedmo_bytestream_read_cb_vtbl;
+     cb->refcount = 1;
++    cb->stream = stream;
++    IMFByteStream_AddRef(cb->stream);
++    cb->status = E_PENDING;
+     cb->event = CreateEventA(NULL, FALSE, FALSE, NULL);
++    if (!cb->event || !(cb->buffer = malloc(size)))
++    {
++        hr = cb->event ? E_OUTOFMEMORY : HRESULT_FROM_WIN32(GetLastError());
++        IMFAsyncCallback_Release(&cb->IMFAsyncCallback_iface);
++        return hr;
++    }
+ 
+-    if (FAILED(hr = IMFByteStream_BeginRead(stream, buffer, size, &cb->IMFAsyncCallback_iface, NULL)))
++    if (FAILED(hr = IMFByteStream_BeginRead(stream, cb->buffer, size, &cb->IMFAsyncCallback_iface, NULL)))
+     {
+         WARN("BeginRead failed, hr %#lx.\n", hr);
+         IMFAsyncCallback_Release(&cb->IMFAsyncCallback_iface);
+         return hr;
+     }
+-    if (WaitForSingleObject(cb->event, 5000) != WAIT_OBJECT_0)
++    *read_size = 0;
++    wait = WaitForSingleObject(cb->event, 5000);
++    if (wait != WAIT_OBJECT_0)
+     {
+-        ERR("Timed out waiting for BeginRead.\n");
++        hr = wait == WAIT_TIMEOUT ? HRESULT_FROM_WIN32(ERROR_TIMEOUT)
++                : HRESULT_FROM_WIN32(GetLastError());
++        ERR("Waiting for BeginRead failed, wait %#lx, hr %#lx.\n", wait, hr);
+         IMFAsyncCallback_Release(&cb->IMFAsyncCallback_iface);
+-        return E_FAIL;
++        return hr;
++    }
++
++    hr = cb->status;
++    if (SUCCEEDED(hr) && cb->read_size > size)
++        hr = E_UNEXPECTED;
++    if (SUCCEEDED(hr))
++    {
++        memcpy(buffer, cb->buffer, cb->read_size);
++        *read_size = cb->read_size;
+     }
+-    result = cb->result;
+-    cb->result = NULL;
+     IMFAsyncCallback_Release(&cb->IMFAsyncCallback_iface);
+-    hr = IMFByteStream_EndRead(stream, result, read_size);
+-    IMFAsyncResult_Release(result);
+     return hr;
+ }
+ 
+@@ -855,7 +1002,9 @@ static HRESULT media_source_start(struct media_source *source, IMFPresentationDe
+         GUID *format, PROPVARIANT *position)
+ {
+     BOOL starting = source->state == SOURCE_STOPPED, seek_message;
++    BOOL cancel_transition_failed = FALSE;
+     IMFStreamDescriptor **descriptors;
++    NTSTATUS status = STATUS_SUCCESS;
+     DWORD i, count;
+     HRESULT hr;
+ 
+@@ -864,6 +1013,8 @@ static HRESULT media_source_start(struct media_source *source, IMFPresentationDe
+ 
+     if (source->state == SOURCE_SHUTDOWN)
+         return MF_E_SHUTDOWN;
++    if (FAILED(source->demux_terminal_error))
++        return source->demux_terminal_error;
+ 
+     if (!source->seekable && position->vt != VT_EMPTY)
+     {
+@@ -884,12 +1035,16 @@ static HRESULT media_source_start(struct media_source *source, IMFPresentationDe
+         return E_OUTOFMEMORY;
+ 
+     if (FAILED(hr = IMFPresentationDescriptor_GetStreamDescriptorCount(descriptor, &count)))
+-        WARN("Failed to get presentation descriptor stream count, hr %#lx\n", hr);
++    {
++        free(descriptors);
++        return hr;
++    }
+ 
+     for (i = 0; i < count; i++)
+     {
+         IMFStreamDescriptor *stream_descriptor;
+         BOOL selected;
++        UINT source_index;
+         DWORD id;
+ 
+         if (FAILED(hr = IMFPresentationDescriptor_GetStreamDescriptorByIndex(descriptor, i,
+@@ -899,10 +1054,10 @@ static HRESULT media_source_start(struct media_source *source, IMFPresentationDe
+         {
+             if (FAILED(hr = IMFStreamDescriptor_GetStreamIdentifier(stream_descriptor, &id)))
+                 WARN("Failed to get stream descriptor id, hr %#lx\n", hr);
+-            else if (id >= source->stream_count)
+-                WARN("Invalid stream descriptor id %lu, hr %#lx\n", id, hr);
++            else if (!media_source_find_stream(source, id, &source_index))
++                WARN("Unknown demux stream descriptor id %lu.\n", id);
+             else if (selected)
+-                IMFStreamDescriptor_AddRef((descriptors[id] = stream_descriptor));
++                IMFStreamDescriptor_AddRef((descriptors[source_index] = stream_descriptor));
+ 
+             IMFStreamDescriptor_Release(stream_descriptor);
+         }
+@@ -910,7 +1065,9 @@ static HRESULT media_source_start(struct media_source *source, IMFPresentationDe
+ 
+     if (position->vt == VT_I8)
+     {
+-        /* Flush: signal demux thread to stop producing, seek, then re-enable. */
++        /* Make every read from the old timeline distinguishable even if the
++         * complete flush begins and ends before that read returns. */
++        media_source_begin_demux_transition(source);
+         source->read_flushing = TRUE;
+         source->flushing = TRUE;
+         source->demux_eof = FALSE;
+@@ -922,19 +1079,60 @@ static HRESULT media_source_start(struct media_source *source, IMFPresentationDe
+             EnterCriticalSection(&stream->queue_cs);
+             media_packet_queue_flush(stream);
+             stream->eos = FALSE;
++            stream->eos_epoch = 0;
++            WakeAllConditionVariable(&stream->queue_cv);
+             LeaveCriticalSection(&stream->queue_cs);
+-            WakeConditionVariable(&stream->queue_cv);
++            stream->eos_sent = FALSE;
+         }
+ 
+         WARN("MF media source seek to %s.\n", debugstr_time(position->hVal.QuadPart));
+-        winedmo_demuxer_set_cancelled(source->demuxer, TRUE);
+-        EnterCriticalSection(&source->demuxer_cs);
+-        winedmo_demuxer_set_cancelled(source->demuxer, FALSE);
+-        winedmo_demuxer_seek(source->demuxer, position->hVal.QuadPart);
+-        LeaveCriticalSection(&source->demuxer_cs);
++        if ((status = winedmo_demuxer_set_cancelled(source->demuxer, TRUE)))
++            cancel_transition_failed = TRUE;
++        else
++        {
++            EnterCriticalSection(&source->demuxer_cs);
++            if ((status = winedmo_demuxer_set_cancelled(source->demuxer, FALSE)))
++                cancel_transition_failed = TRUE;
++            else
++                status = winedmo_demuxer_seek(source->demuxer, position->hVal.QuadPart);
++            LeaveCriticalSection(&source->demuxer_cs);
++        }
+ 
+-        source->flushing = FALSE;
+-        source->read_flushing = FALSE;
++        if (cancel_transition_failed)
++        {
++            /* Cancellation state is now unknown.  Keep the epoch odd and stop
++             * the demux producer instead of turning every later read into EOF. */
++            source->demux_thread_shutdown = true;
++            source->demux_terminal_error = HRESULT_FROM_NT(status);
++            for (i = 0; i < source->stream_count; i++)
++            {
++                struct media_stream *stream = source->streams[i];
++
++                EnterCriticalSection(&stream->queue_cs);
++                ++stream->request_generation;
++                stream->active = FALSE;
++                stream->paused = FALSE;
++                stream->eos = TRUE;
++                stream->eos_epoch = media_source_get_demux_transition(source);
++                WakeAllConditionVariable(&stream->queue_cv);
++                LeaveCriticalSection(&stream->queue_cs);
++                flush_token_queue(stream, FALSE);
++            }
++        }
++        else
++        {
++            source->flushing = FALSE;
++            source->read_flushing = FALSE;
++            media_source_end_demux_transition(source);
++        }
++
++        if (status)
++        {
++            for (i = 0; i < source->stream_count; i++)
++                if (descriptors[i]) IMFStreamDescriptor_Release(descriptors[i]);
++            free(descriptors);
++            return HRESULT_FROM_NT(status);
++        }
+     }
+ 
+     for (i = 0; i < source->stream_count; i++)
+@@ -942,14 +1140,26 @@ static HRESULT media_source_start(struct media_source *source, IMFPresentationDe
+         struct media_stream *stream = source->streams[i];
+         BOOL was_active = !starting && stream->active;
+ 
++        EnterCriticalSection(&stream->queue_cs);
+         if (position->vt != VT_EMPTY)
++        {
+             stream->eos = FALSE;
+-
+-        if (!(stream->active = !!descriptors[i]))
++            stream->eos_epoch = 0;
++        }
++        stream->paused = FALSE;
++        if (was_active && !descriptors[i])
++            ++stream->request_generation;
++        stream->active = !!descriptors[i];
++        if (!stream->active)
+         {
+-            /* stream deselected -- nothing special needed, demux thread skips inactive streams */
++            media_packet_queue_flush(stream);
++            WakeAllConditionVariable(&stream->queue_cv);
+         }
+-        else
++        LeaveCriticalSection(&stream->queue_cs);
++        if (position->vt != VT_EMPTY)
++            stream->eos_sent = FALSE;
++
++        if (stream->active)
+         {
+             if (FAILED(hr = media_stream_start(stream, was_active, seek_message, position)))
+                 WARN("Failed to start media stream, hr %#lx\n", hr);
+@@ -968,7 +1178,7 @@ static HRESULT media_source_start(struct media_source *source, IMFPresentationDe
+     source->state = SOURCE_RUNNING;
+ 
+     for (i = 0; i < source->stream_count; i++)
+-        flush_token_queue(source->streams[i], position->vt == VT_EMPTY);
++        flush_token_queue(source->streams[i], source->streams[i]->active);
+ 
+     return IMFMediaEventQueue_QueueEventParamVar(source->event_queue,
+             seek_message ? MESourceSeeked : MESourceStarted, &GUID_NULL, S_OK, position);
+@@ -991,6 +1201,11 @@ static HRESULT media_source_pause(struct media_source *source)
+     for (i = 0; i < source->stream_count; i++)
+     {
+         struct media_stream *stream = source->streams[i];
++
++        EnterCriticalSection(&stream->queue_cs);
++        stream->paused = TRUE;
++        WakeAllConditionVariable(&stream->queue_cv);
++        LeaveCriticalSection(&stream->queue_cs);
+         if (stream->active && FAILED(hr = IMFMediaEventQueue_QueueEventParamVar(stream->event_queue,
+                     MEStreamPaused, &GUID_NULL, S_OK, NULL)))
+             WARN("Failed to queue MEStreamPaused event, hr %#lx\n", hr);
+@@ -1016,6 +1231,12 @@ static HRESULT media_source_stop(struct media_source *source)
+         if (stream->active && FAILED(hr = IMFMediaEventQueue_QueueEventParamVar(stream->event_queue,
+                     MEStreamStopped, &GUID_NULL, S_OK, NULL)))
+             WARN("Failed to queue MEStreamStopped event, hr %#lx\n", hr);
++        EnterCriticalSection(&stream->queue_cs);
++        ++stream->request_generation;
++        stream->active = FALSE;
++        stream->paused = FALSE;
++        WakeAllConditionVariable(&stream->queue_cv);
++        LeaveCriticalSection(&stream->queue_cs);
+     }
+ 
+     source->state = SOURCE_STOPPED;
+@@ -1051,7 +1272,9 @@ static HRESULT media_stream_send_eos(struct media_source *source, struct media_s
+ 
+     TRACE("source %p, stream %p\n", source, stream);
+ 
+-    stream->eos = TRUE;
++    if (stream->eos_sent)
++        return S_OK;
++    stream->eos_sent = TRUE;
+     if (FAILED(hr = IMFMediaEventQueue_QueueEventParamVar(stream->event_queue,
+             MEEndOfStream, &GUID_NULL, S_OK, &empty)))
+         WARN("Failed to queue MEEndOfStream event, hr %#lx\n", hr);
+@@ -1059,7 +1282,7 @@ static HRESULT media_stream_send_eos(struct media_source *source, struct media_s
+     for (i = 0; i < source->stream_count; i++)
+     {
+         struct media_stream *s = source->streams[i];
+-        if (s->active && !s->eos)
++        if (s->active && !s->eos_sent)
+             return S_OK;
+     }
+ 
+@@ -1107,15 +1330,16 @@ out:
+     return hr;
+ }
+ 
+-static struct media_packet *stream_dequeue_packet(struct media_stream *stream)
++static struct media_packet *stream_dequeue_packet(struct media_stream *stream, LONG generation)
+ {
+     struct media_source *source = impl_from_IMFMediaSource(stream->media_source);
+     struct media_packet *pkt = NULL;
+ 
+     EnterCriticalSection(&stream->queue_cs);
+-    while (list_empty(&stream->packet_queue) && !stream->eos && !source->demux_thread_shutdown)
++    while (generation == stream->request_generation && list_empty(&stream->packet_queue)
++            && stream->active && !stream->paused && !stream->eos && !source->demux_thread_shutdown)
+         SleepConditionVariableCS(&stream->queue_cv, &stream->queue_cs, INFINITE);
+-    if (!list_empty(&stream->packet_queue))
++    if (generation == stream->request_generation && !list_empty(&stream->packet_queue))
+     {
+         pkt = LIST_ENTRY(list_head(&stream->packet_queue), struct media_packet, entry);
+         list_remove(&pkt->entry);
+@@ -1126,27 +1350,85 @@ static struct media_packet *stream_dequeue_packet(struct media_stream *stream)
+     return pkt;
+ }
+ 
+-static HRESULT wait_on_sample(struct media_stream *stream, IUnknown *token)
++static void stream_requeue_packet(struct media_stream *stream, struct media_packet *pkt)
++{
++    EnterCriticalSection(&stream->queue_cs);
++    list_add_head(&stream->packet_queue, &pkt->entry);
++    ++stream->queued_packets;
++    stream->queued_bytes += pkt->size;
++    WakeConditionVariable(&stream->queue_cv);
++    LeaveCriticalSection(&stream->queue_cs);
++}
++
++static HRESULT wait_on_sample(struct media_stream *stream, IUnknown **token, LONG generation)
+ {
+     struct media_source *source = impl_from_IMFMediaSource(stream->media_source);
+     struct media_packet *pkt;
++    LONG epoch, eos_epoch;
++    BOOL eos;
+     HRESULT hr;
+ 
+-    TRACE("%p, %p\n", stream, token);
++    TRACE("%p, %p\n", stream, *token);
+ 
+-    LeaveCriticalSection(&source->cs);
+-    pkt = stream_dequeue_packet(stream);
+-    EnterCriticalSection(&source->cs);
++    for (;;)
++    {
++        LeaveCriticalSection(&source->cs);
++        pkt = stream_dequeue_packet(stream, generation);
++        EnterCriticalSection(&source->cs);
+ 
+-    if (source->state == SOURCE_SHUTDOWN)
+-        return S_OK;
++        if (generation != stream->request_generation)
++        {
++            if (pkt)
++                media_packet_free(pkt);
++            return S_OK;
++        }
+ 
+-    if (!pkt)
+-        return media_stream_send_eos(source, stream);
++        if (source->state == SOURCE_SHUTDOWN || !stream->active)
++        {
++            if (pkt)
++                media_packet_free(pkt);
++            return S_OK;
++        }
+ 
+-    hr = media_stream_send_sample(stream, pkt, token);
+-    media_packet_free(pkt);
+-    return hr;
++        epoch = media_source_get_demux_transition(source);
++        if (pkt && ((epoch & 1) || pkt->epoch != epoch))
++        {
++            media_packet_free(pkt);
++            continue;
++        }
++
++        if (source->state == SOURCE_PAUSED)
++        {
++            if (pkt)
++                stream_requeue_packet(stream, pkt);
++            if (prepend_token(stream, *token))
++                *token = NULL;
++            else
++                WARN("Could not retain paused sample request.\n");
++            return S_OK;
++        }
++
++        if (source->state != SOURCE_RUNNING)
++        {
++            if (pkt)
++                media_packet_free(pkt);
++            return S_OK;
++        }
++
++        if (pkt)
++        {
++            hr = media_stream_send_sample(stream, pkt, *token);
++            media_packet_free(pkt);
++            return hr;
++        }
++
++        EnterCriticalSection(&stream->queue_cs);
++        eos = stream->eos;
++        eos_epoch = stream->eos_epoch;
++        LeaveCriticalSection(&stream->queue_cs);
++        if (eos && eos_epoch == epoch && !(epoch & 1))
++            return media_stream_send_eos(source, stream);
++    }
+ }
+ 
+ /* ========================================================================
+@@ -1168,6 +1450,7 @@ static DWORD CALLBACK source_demux_thread(void *arg)
+         NTSTATUS status;
+         struct media_stream *stream;
+         struct media_packet *pkt;
++        LONG read_epoch;
+         BYTE *src_data;
+         DWORD data_len;
+ 
+@@ -1199,12 +1482,21 @@ static DWORD CALLBACK source_demux_thread(void *arg)
+         needed_size = buffer_size;
+ 
+         EnterCriticalSection(&source->demuxer_cs);
++        read_epoch = media_source_get_demux_transition(source);
++        if (read_epoch & 1)
++        {
++            LeaveCriticalSection(&source->demuxer_cs);
++            IMediaBuffer_Release(&sbuf->IMediaBuffer_iface);
++            Sleep(1);
++            continue;
++        }
+         status = winedmo_demuxer_read(source->demuxer, &stream_idx, &output, &needed_size);
+         LeaveCriticalSection(&source->demuxer_cs);
+ 
+-        /* A flush can begin while the read is in flight.  Do not enqueue the
+-         * packet that made the flush wait for demuxer_cs. */
+-        if (source->flushing || source->demux_thread_shutdown)
++        /* A complete seek may begin and end before this read returns.  The
++         * transition epoch detects that case even after flushing is clear. */
++        if (read_epoch != media_source_get_demux_transition(source)
++                || source->demux_thread_shutdown)
+         {
+             IMediaBuffer_Release(&sbuf->IMediaBuffer_iface);
+             continue;
+@@ -1221,20 +1513,28 @@ static DWORD CALLBACK source_demux_thread(void *arg)
+         {
+             IMediaBuffer_Release(&sbuf->IMediaBuffer_iface);
+ 
+-            if (source->flushing || source->demux_thread_shutdown)
+-                continue;
+-
+             /* Real EOF: signal EOS to all active streams. */
+             TRACE("Demuxer reached end of file.\n");
+             source->demux_eof = TRUE;
++            if (read_epoch != media_source_get_demux_transition(source))
++            {
++                source->demux_eof = FALSE;
++                continue;
++            }
+             for (UINT i = 0; i < source->stream_count; ++i)
+             {
+                 struct media_stream *s = source->streams[i];
+                 EnterCriticalSection(&s->queue_cs);
+-                s->eos = TRUE;
++                if (read_epoch == media_source_get_demux_transition(source) && s->active)
++                {
++                    s->eos = TRUE;
++                    s->eos_epoch = read_epoch;
++                }
++                WakeAllConditionVariable(&s->queue_cv);
+                 LeaveCriticalSection(&s->queue_cs);
+-                WakeConditionVariable(&s->queue_cv);
+             }
++            if (read_epoch != media_source_get_demux_transition(source))
++                source->demux_eof = FALSE;
+             continue;
+         }
+ 
+@@ -1245,19 +1545,17 @@ static DWORD CALLBACK source_demux_thread(void *arg)
+             continue;
+         }
+ 
+-        if (stream_idx >= source->stream_count)
++        if (!(stream = media_source_find_stream(source, stream_idx, NULL)))
+         {
+             IMediaBuffer_Release(&sbuf->IMediaBuffer_iface);
+             continue;
+         }
+ 
+-        stream = source->streams[stream_idx];
+-
+         IMediaBuffer_SetLength(&sbuf->IMediaBuffer_iface, needed_size);
+         data_len = needed_size;
+         IMediaBuffer_GetBufferAndLength(&sbuf->IMediaBuffer_iface, &src_data, NULL);
+ 
+-        if (!data_len || !stream->active)
++        if (!data_len)
+         {
+             IMediaBuffer_Release(&sbuf->IMediaBuffer_iface);
+             continue;
+@@ -1269,6 +1567,7 @@ static DWORD CALLBACK source_demux_thread(void *arg)
+ 
+             memcpy(pkt->data, src_data, data_len);
+             pkt->size = data_len;
++            pkt->epoch = read_epoch;
+             pkt->dts      = (output.dwStatus & DMO_OUTPUT_DATA_BUFFERF_TIME)
+                             ? output.rtTimestamp : INT64_MIN;
+             pkt->pts      = (output.dwStatus & DMO_OUTPUT_DATA_BUFFERF_TIME)
+@@ -1278,7 +1577,8 @@ static DWORD CALLBACK source_demux_thread(void *arg)
+             list_init(&pkt->entry);
+ 
+             EnterCriticalSection(&stream->queue_cs);
+-            if (!source->flushing && !source->demux_thread_shutdown)
++            if (read_epoch == media_source_get_demux_transition(source)
++                    && !(read_epoch & 1) && !source->demux_thread_shutdown && stream->active)
+             {
+                 list_add_tail(&stream->packet_queue, &pkt->entry);
+                 ++stream->queued_packets;
+@@ -1322,7 +1622,14 @@ static HRESULT WINAPI source_async_commands_Invoke(IMFAsyncCallback *iface, IMFA
+     HRESULT hr;
+ 
+     if (FAILED(hr = IMFAsyncResult_GetState(result, &state)))
++    {
++        EnterCriticalSection(&source->cs);
++        assert(source->pending_work_items > 0);
++        --source->pending_work_items;
++        WakeAllConditionVariable(&source->work_cv);
++        LeaveCriticalSection(&source->cs);
+         return hr;
++    }
+ 
+     EnterCriticalSection(&source->cs);
+ 
+@@ -1336,7 +1643,11 @@ static HRESULT WINAPI source_async_commands_Invoke(IMFAsyncCallback *iface, IMFA
+             PROPVARIANT position = command->u.start.position;
+ 
+             if (FAILED(hr = media_source_start(source, descriptor, &format, &position)))
++            {
+                 WARN("Failed to start source %p, hr %#lx\n", source, hr);
++                IMFMediaEventQueue_QueueEventParamVar(source->event_queue, MEError,
++                        &GUID_NULL, hr, NULL);
++            }
+             break;
+         }
+         case SOURCE_ASYNC_PAUSE:
+@@ -1348,21 +1659,36 @@ static HRESULT WINAPI source_async_commands_Invoke(IMFAsyncCallback *iface, IMFA
+                 WARN("Failed to stop source %p, hr %#lx\n", source, hr);
+             break;
+         case SOURCE_ASYNC_REQUEST_SAMPLE:
+-            if (source->state == SOURCE_PAUSED)
+-                enqueue_token(command->u.request_sample.stream, command->u.request_sample.token);
+-            else if (source->state == SOURCE_RUNNING)
++        {
++            struct media_stream *stream = command->u.request_sample.stream;
++
++            if (command->u.request_sample.generation == stream->request_generation
++                    && source->state == SOURCE_RUNNING && stream->active
++                    && dequeue_token(stream, &command->u.request_sample.token))
+             {
+-                if (FAILED(hr = wait_on_sample(command->u.request_sample.stream,
+-                        command->u.request_sample.token)))
++                if (FAILED(hr = wait_on_sample(stream, &command->u.request_sample.token,
++                        command->u.request_sample.generation)))
+                     WARN("Failed to request sample, hr %#lx\n", hr);
+             }
++            stream->sample_worker_pending = FALSE;
++            if (stream->eos_sent)
++                flush_token_queue(stream, FALSE);
++            else if (source->state == SOURCE_RUNNING && stream->active)
++                flush_token_queue(stream, TRUE);
+             break;
++        }
+     }
+ 
+     LeaveCriticalSection(&source->cs);
+ 
+     IUnknown_Release(state);
+ 
++    EnterCriticalSection(&source->cs);
++    assert(source->pending_work_items > 0);
++    --source->pending_work_items;
++    WakeAllConditionVariable(&source->work_cv);
++    LeaveCriticalSection(&source->cs);
++
+     return S_OK;
+ }
+ 
+@@ -1521,7 +1847,6 @@ static HRESULT WINAPI media_stream_RequestSample(IMFMediaStream *iface, IUnknown
+ {
+     struct media_stream *stream = impl_from_IMFMediaStream(iface);
+     struct media_source *source = impl_from_IMFMediaSource(stream->media_source);
+-    IUnknown *op;
+     HRESULT hr;
+ 
+     TRACE("%p, %p.\n", iface, token);
+@@ -1532,23 +1857,25 @@ static HRESULT WINAPI media_stream_RequestSample(IMFMediaStream *iface, IUnknown
+         hr = MF_E_SHUTDOWN;
+     else if (!stream->active)
+         hr = MF_E_MEDIA_SOURCE_WRONGSTATE;
++    else if (stream->eos_sent)
++        hr = MF_E_END_OF_STREAM;
+     else
+     {
+-        if (SUCCEEDED(hr = source_create_async_op(SOURCE_ASYNC_REQUEST_SAMPLE, &op)))
++        if (token)
++            IUnknown_AddRef(token);
++        if (!enqueue_token(stream, token))
+         {
+-            struct source_async_command *command = impl_from_async_command_IUnknown(op);
+-            command->u.request_sample.stream = stream;
+             if (token)
+-                IUnknown_AddRef(token);
+-            command->u.request_sample.token = token;
+-
+-            /* SOURCE_ASYNC_REQUEST_SAMPLE may block waiting for demuxed packets.
+-             * Use the standard MF queue so per-stream sample waits are not
+-             * serialized behind each other on the source's private command queue. */
+-            hr = MFPutWorkItem(MFASYNC_CALLBACK_QUEUE_STANDARD,
+-                    &source->async_commands_callback, op);
+-            IUnknown_Release(op);
++                IUnknown_Release(token);
++            hr = E_OUTOFMEMORY;
+         }
++        else if (source->state == SOURCE_RUNNING
++                && FAILED(hr = schedule_sample_worker(stream)))
++        {
++            flush_token_queue(stream, FALSE);
++        }
++        else
++            hr = S_OK;
+     }
+ 
+     LeaveCriticalSection(&source->cs);
+@@ -1595,7 +1922,7 @@ static HRESULT media_stream_create(IMFMediaSource *source, IMFStreamDescriptor *
+     IMFStreamDescriptor_AddRef(descriptor);
+     object->descriptor = descriptor;
+ 
+-    object->active = TRUE;
++    object->active = FALSE;
+     object->eos = FALSE;
+     object->stream_index = stream_index;
+     object->is_video = is_video;
+@@ -2059,7 +2386,7 @@ static HRESULT WINAPI media_source_Start(IMFMediaSource *iface, IMFPresentationD
+         command->u.start.format = *time_format;
+         PropVariantCopy(&command->u.start.position, position);
+ 
+-        hr = MFPutWorkItem(source->async_commands_queue, &source->async_commands_callback, op);
++        hr = source_submit_work_item(source, source->async_commands_queue, op);
+         IUnknown_Release(op);
+     }
+ 
+@@ -2082,7 +2409,7 @@ static HRESULT WINAPI media_source_Stop(IMFMediaSource *iface)
+         hr = MF_E_SHUTDOWN;
+     else if (SUCCEEDED(hr = source_create_async_op(SOURCE_ASYNC_STOP, &op)))
+     {
+-        hr = MFPutWorkItem(source->async_commands_queue, &source->async_commands_callback, op);
++        hr = source_submit_work_item(source, source->async_commands_queue, op);
+         IUnknown_Release(op);
+     }
+ 
+@@ -2107,7 +2434,7 @@ static HRESULT WINAPI media_source_Pause(IMFMediaSource *iface)
+         hr = MF_E_INVALID_STATE_TRANSITION;
+     else if (SUCCEEDED(hr = source_create_async_op(SOURCE_ASYNC_PAUSE, &op)))
+     {
+-        hr = MFPutWorkItem(source->async_commands_queue, &source->async_commands_callback, op);
++        hr = source_submit_work_item(source, source->async_commands_queue, op);
+         IUnknown_Release(op);
+     }
+ 
+@@ -2119,6 +2446,7 @@ static HRESULT WINAPI media_source_Pause(IMFMediaSource *iface)
+ static HRESULT WINAPI media_source_Shutdown(IMFMediaSource *iface)
+ {
+     struct media_source *source = impl_from_IMFMediaSource(iface);
++    DWORD async_commands_queue, sample_requests_queue;
+     HRESULT hr;
+ 
+     TRACE("%p.\n", iface);
+@@ -2132,6 +2460,7 @@ static HRESULT WINAPI media_source_Shutdown(IMFMediaSource *iface)
+     }
+ 
+     source->state = SOURCE_SHUTDOWN;
++    media_source_begin_demux_transition(source);
+ 
+     /* Signal demux thread and all waiting stream queues to unblock. */
+     source->demux_thread_shutdown = true;
+@@ -2142,11 +2471,32 @@ static HRESULT WINAPI media_source_Shutdown(IMFMediaSource *iface)
+     {
+         struct media_stream *stream = source->streams[i];
+         EnterCriticalSection(&stream->queue_cs);
++        stream->active = FALSE;
++        stream->paused = FALSE;
+         stream->eos = TRUE;
++        stream->eos_epoch = media_source_get_demux_transition(source);
++        WakeAllConditionVariable(&stream->queue_cv);
+         LeaveCriticalSection(&stream->queue_cs);
+-        WakeConditionVariable(&stream->queue_cv);
+     }
+ 
++    /* Queue unlock is not a portable drain and may let queued callbacks run
++     * afterward.  Every source command was counted before submission, so wait
++     * while SleepConditionVariableCS releases source->cs for callbacks. */
++    while (source->pending_work_items)
++        SleepConditionVariableCS(&source->work_cv, &source->cs, INFINITE);
++
++    async_commands_queue = source->async_commands_queue;
++    sample_requests_queue = source->sample_requests_queue;
++    source->async_commands_queue = 0;
++    source->sample_requests_queue = 0;
++
++    /* Avoid holding source->cs across queue unlock in case an implementation
++     * chooses to finish destruction synchronously. */
++    LeaveCriticalSection(&source->cs);
++    MFUnlockWorkQueue(sample_requests_queue);
++    MFUnlockWorkQueue(async_commands_queue);
++    EnterCriticalSection(&source->cs);
++
+     if (source->demux_thread)
+     {
+         WaitForSingleObject(source->demux_thread, INFINITE);
+@@ -2178,8 +2528,6 @@ static HRESULT WINAPI media_source_Shutdown(IMFMediaSource *iface)
+ 
+     LeaveCriticalSection(&source->cs);
+ 
+-    MFUnlockWorkQueue(source->async_commands_queue);
+-
+     return S_OK;
+ }
+ 
+@@ -2256,12 +2604,16 @@ static HRESULT media_source_create(struct object_context *context, IMFMediaSourc
+     object->cs.DebugInfo->Spare[0] = (DWORD_PTR)(__FILE__ ": cs");
+     InitializeCriticalSectionEx(&object->demuxer_cs, 0, RTL_CRITICAL_SECTION_FLAG_FORCE_DEBUG_INFO);
+     object->demuxer_cs.DebugInfo->Spare[0] = (DWORD_PTR)(__FILE__ ": demuxer_cs");
++    InitializeConditionVariable(&object->work_cv);
+ 
+     if (FAILED(hr = MFCreateEventQueue(&object->event_queue)))
+         goto fail;
+ 
+     if (FAILED(hr = MFAllocateWorkQueue(&object->async_commands_queue)))
+         goto fail;
++    if (FAILED(hr = MFAllocateWorkQueueEx(MF_MULTITHREADED_WORKQUEUE,
++            &object->sample_requests_queue)))
++        goto fail;
+ 
+     /* Set up winedmo stream callbacks. */
+     object->demuxer_stream.stream.p_seek = source_stream_seek_cb;
+@@ -2361,6 +2713,7 @@ fail:
+ 
+     if (object->demux_thread)
+     {
++        media_source_begin_demux_transition(object);
+         object->demux_thread_shutdown = true;
+         object->read_flushing = true;
+         winedmo_demuxer_set_cancelled(object->demuxer, TRUE);
+@@ -2380,6 +2733,8 @@ fail:
+ 
+     if (object->demuxer.handle)
+         winedmo_demuxer_destroy(&object->demuxer);
++    if (object->sample_requests_queue)
++        MFUnlockWorkQueue(object->sample_requests_queue);
+     if (object->async_commands_queue)
+         MFUnlockWorkQueue(object->async_commands_queue);
+     if (object->event_queue)
+@@ -2835,15 +3190,7 @@ static HRESULT WINAPI scheme_handler_BeginCreateObject(IMFSchemeHandler *iface,
+     if (cancel_cookie)
+         *cancel_cookie = NULL;
+ 
+-    if (!wcsnicmp(url, L"http://", 7) || !wcsnicmp(url, L"https://", 8))
+-    {
+-        if (FAILED(hr = URLOpenBlockingStreamW(NULL, url, &stream, 0, NULL)))
+-        {
+-            WARN("Failed to open url %s, hr %#lx\n", debugstr_w(url), hr);
+-            return hr;
+-        }
+-    }
+-    else if (FAILED(hr = CreateStreamOnHGlobal(0, TRUE, &stream)))
++    if (FAILED(hr = CreateStreamOnHGlobal(0, TRUE, &stream)))
+         return hr;
+ 
+     hr = MFCreateMFByteStreamOnStream(stream, &bytestream);
+@@ -2852,8 +3199,13 @@ static HRESULT WINAPI scheme_handler_BeginCreateObject(IMFSchemeHandler *iface,
+         return hr;
+ 
+     if (FAILED(hr = MFCreateAsyncResult(NULL, callback, state, &result)))
++    {
++        IMFByteStream_Release(bytestream);
+         return hr;
+-    if (FAILED(hr = object_context_create(flags, bytestream, url, -1, 0, result, &context)))
++    }
++    hr = object_context_create(flags, bytestream, url, -1, 0, result, &context);
++    IMFByteStream_Release(bytestream);
++    if (FAILED(hr))
+     {
+         IMFAsyncResult_Release(result);
+         return hr;
+@@ -2879,7 +3231,8 @@ static HRESULT WINAPI scheme_handler_EndCreateObject(IMFSchemeHandler *iface, IM
+     {
+         *obj_type = MF_OBJECT_INVALID;
+         *object = NULL;
+-        return MF_E_UNEXPECTED;
++        hr = IMFAsyncResult_GetStatus(result);
++        return FAILED(hr) ? hr : MF_E_UNEXPECTED;
+     }
+ 
+     hr = IMFAsyncResult_GetStatus(entry->result);
+@@ -2940,17 +3293,63 @@ static HRESULT WINAPI scheme_handler_callback_GetParameters(IMFAsyncCallback *if
+     return E_NOTIMPL;
+ }
+ 
++static BOOL is_http_hls_url(const WCHAR *url)
++{
++    const WCHAR *cursor;
++
++    if (!url || (wcsnicmp(url, L"http://", 7) && wcsnicmp(url, L"https://", 8)))
++        return FALSE;
++
++    for (cursor = url; *cursor; cursor++)
++        if (!wcsnicmp(cursor, L".m3u8", 5) || !wcsnicmp(cursor, L"/hls_playlist/", 14))
++            return TRUE;
++
++    return FALSE;
++}
++
+ static HRESULT WINAPI scheme_handler_callback_Invoke(IMFAsyncCallback *iface, IMFAsyncResult *result)
+ {
+     struct scheme_handler *handler = scheme_handler_from_IMFAsyncCallback(iface);
+     IUnknown *object, *state = IMFAsyncResult_GetStateNoAddRef(result);
+     struct object_context *context;
+     struct result_entry *entry;
++    IMFByteStream *bytestream;
++    QWORD file_size, stream_offset;
++    IStream *stream;
++    DWORD caps;
+     HRESULT hr;
+ 
+     if (!state || !(context = impl_from_IUnknown(state)))
+         return E_INVALIDARG;
+ 
++    if (context->url && !is_http_hls_url(context->url)
++            && (!wcsnicmp(context->url, L"http://", 7)
++            || !wcsnicmp(context->url, L"https://", 8)))
++    {
++        if (FAILED(hr = URLOpenBlockingStreamW(NULL, context->url, &stream, 0, NULL)))
++        {
++            WARN("Failed to open network media, hr %#lx.\n", hr);
++            goto done;
++        }
++
++        hr = MFCreateMFByteStreamOnStream(stream, &bytestream);
++        IStream_Release(stream);
++        if (FAILED(hr))
++            goto done;
++
++        IMFByteStream_Release(context->stream);
++        context->stream = bytestream;
++
++        if (SUCCEEDED(IMFByteStream_GetCapabilities(bytestream, &caps))
++                && (caps & MFBYTESTREAM_IS_SEEKABLE)
++                && SUCCEEDED(IMFByteStream_GetLength(bytestream, &file_size))
++                && SUCCEEDED(IMFByteStream_GetCurrentPosition(bytestream, &stream_offset)))
++        {
++            context->file_size = file_size;
++            context->stream_offset = stream_offset;
++        }
++    }
++
+     if (FAILED(hr = media_source_create(context, (IMFMediaSource **)&object)))
+         WARN("Failed to create media source, hr %#lx\n", hr);
+     else
+@@ -2967,6 +3366,7 @@ static HRESULT WINAPI scheme_handler_callback_Invoke(IMFAsyncCallback *iface, IM
+         IUnknown_Release(object);
+     }
+ 
++done:
+     IMFAsyncResult_SetStatus(context->result, hr);
+     MFInvokeCallback(context->result);
+ 
+diff --git a/dlls/winedmo/unix_demuxer.c b/dlls/winedmo/unix_demuxer.c
+index d2f74b9..9f97138 100644
+--- a/dlls/winedmo/unix_demuxer.c
++++ b/dlls/winedmo/unix_demuxer.c
+@@ -35,6 +35,7 @@ WINE_DEFAULT_DEBUG_CHANNEL(dmo);
+ 
+ #define RTSP_OPEN_TIMEOUT_US INT64_C(30000000)
+ #define RTSP_IO_TIMEOUT_US   INT64_C(15000000)
++#define HLS_IO_TIMEOUT_US    INT64_C(30000000)
+ 
+ static inline const char *debugstr_averr( int err )
+ {
+@@ -796,9 +797,14 @@ static void parse_mp4_streams_metadata( struct demuxer *demuxer )
+ 
+ static BOOL is_http_hls_url( const char *url )
+ {
+-    if (!url || (strncmp( url, "http://", 7 ) && strncmp( url, "https://", 8 ))) return FALSE;
++    const char *cursor;
+ 
+-    return !!strstr( url, ".m3u8" ) || !!strstr( url, "/hls_playlist/" );
++    if (!url || (strncasecmp( url, "http://", 7 ) && strncasecmp( url, "https://", 8 ))) return FALSE;
++
++    for (cursor = url; *cursor; cursor++)
++        if (!strncasecmp( cursor, ".m3u8", 5 ) || !strncasecmp( cursor, "/hls_playlist/", 14 )) return TRUE;
++
++    return FALSE;
+ }
+ 
+ enum direct_network_url
+@@ -893,13 +899,17 @@ NTSTATUS demuxer_create( void *arg )
+          * exposes the downloaded manifest bytes, which breaks YouTube HLS
+          * streams used by VRChat's in-game video player. */
+         demuxer->direct_url = TRUE;
++        demuxer->io_timeout = HLS_IO_TIMEOUT_US;
+         demuxer->ctx->interrupt_callback.callback = demuxer_interrupt_callback;
+         demuxer->ctx->interrupt_callback.opaque = demuxer;
++        demuxer_set_deadline( demuxer, HLS_IO_TIMEOUT_US );
+         if ((ret = avformat_open_input( &demuxer->ctx, params->url, hls, NULL )) < 0)
+         {
++            demuxer_set_deadline( demuxer, 0 );
+             ERR( "Failed to open HLS URL, error %s.\n", debugstr_averr(ret) );
+             goto failed;
+         }
++        demuxer_set_deadline( demuxer, 0 );
+     }
+     else if ((rtsp_kind = get_rtsp_url_kind( params->url )))
+     {
+@@ -1176,7 +1186,7 @@ NTSTATUS demuxer_seek( void *arg )
+ {
+     struct demuxer_seek_params *params = arg;
+     struct demuxer *demuxer = get_demuxer( params->demuxer );
+-    int64_t timestamp = params->timestamp * AV_TIME_BASE / 10000000;
++    int64_t timestamp = av_rescale( params->timestamp, AV_TIME_BASE, 10000000 );
+     NTSTATUS status;
+     int i, ret;
+ 
+diff --git a/dlls/winedmo/unixlib.c b/dlls/winedmo/unixlib.c
+index dc4b7be..1e4d92b 100644
+--- a/dlls/winedmo/unixlib.c
++++ b/dlls/winedmo/unixlib.c
+@@ -36,15 +36,32 @@ int64_t unix_seek_callback( void *opaque, int64_t offset, int whence )
+ {
+     struct seek_callback_params params = {.dispatch = {.callback = seek_callback}, .context = (UINT_PTR)opaque};
+     struct stream_context *context = opaque;
++    UINT64 base = 0;
+     void *ret_ptr;
+     ULONG ret_len;
+     int status;
+ 
+     TRACE( "opaque %p, offset %#"PRIx64", whence %#x\n", opaque, offset, whence );
+ 
+-    if (whence == AVSEEK_SIZE) return context->length;
+-    if (whence == SEEK_END) offset += context->length;
+-    if (whence == SEEK_CUR) offset += context->position;
++    whence &= ~AVSEEK_FORCE;
++    if (whence == AVSEEK_SIZE)
++        return context->length <= INT64_MAX ? context->length : AVERROR( EINVAL );
++    if (whence == SEEK_END)
++        base = context->length;
++    else if (whence == SEEK_CUR)
++        base = context->position;
++    else if (whence != SEEK_SET)
++        return AVERROR( EINVAL );
++
++    if (base > INT64_MAX) return AVERROR( EINVAL );
++    if (offset < -(int64_t)base)
++        offset = 0;
++    else if (offset > INT64_MAX - (int64_t)base)
++        offset = INT64_MAX;
++    else
++        offset += base;
++
++    if (offset < 0) offset = 0;
+     if ((UINT64)offset > context->length) offset = context->length;
+ 
+     if (offset / context->capacity != context->position / context->capacity)
+-- 
+2.54.0
+

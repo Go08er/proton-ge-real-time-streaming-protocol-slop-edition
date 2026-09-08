@@ -1,0 +1,31 @@
+# SPDX-License-Identifier: BSD-3-Clause
+# The public port is a bounded loopback TCP gate in front of MediaMTX. The gate
+# opens only after the backend publishes H.264/AAC and a native decode observes
+# nonzero PCM.
+load "rtsp://127.0.0.1:18554/fixture"
+wait_event CANPLAY 20000
+play
+wait_event PLAYING 10000
+loop 4
+wait_ms 1000
+snapshot "rtsp-live-g1"
+endloop
+
+replace "rtsp://127.0.0.1:18554/fixture"
+wait_event CANPLAY 20000
+play
+wait_event PLAYING 10000
+loop 4
+wait_ms 1000
+snapshot "rtsp-live-g2"
+endloop
+
+replace "rtsp://127.0.0.1:18554/fixture"
+wait_event CANPLAY 20000
+play
+wait_event PLAYING 10000
+loop 4
+wait_ms 1000
+snapshot "rtsp-live-g3"
+endloop
+shutdown

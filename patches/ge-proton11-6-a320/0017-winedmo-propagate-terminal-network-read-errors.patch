@@ -1,0 +1,637 @@
+From a06ad1f1d42596f40e8b617c984152face23d190 Mon Sep 17 00:00:00 2001
+From: RTSP-on-GE design <rtsp-on-ge@example.invalid>
+Date: Thu, 23 Jul 2026 18:38:25 -0500
+Subject: [PATCH] winedmo: propagate terminal network read errors
+
+Direct HTTP, HLS, and RTSP inputs currently turn terminal FFmpeg read failures into clean end-of-file. For progressive MP4, avformat_seek_file() also returns before the HTTP Range reopen, so a failed reopen is discovered only after Media Foundation has reported SEEKED.
+
+Keep true EOF and legacy local-bytestream behavior unchanged. Classify terminal direct-network failures, prefetch one packet after progressive-HTTP seeks so deferred Range errors are causal, retain the first source error, wake blocked sample requests, and forward only the current source through MediaSession to MediaEngine ERROR. Clear terminal error state when a new source is selected.
+
+A3.20: after an irreversible failed seek, normalize an otherwise unrecognized
+error to MF_E_INVALID_POSITION and reuse the existing first-error-wins route.
+Retain the original numeric error in a warning. Session/Engine admit exactly
+that additional status and classify it DECODE, not NETWORK. Pre-flush argument
+rejection, source/generation ownership, cancellation and network classifications,
+manual reopen, and completion without false Started/Seeked remain intact.
+No retries, generic error forwarding, or synthetic EOF are added.
+
+Source-contract/model tests: tests/network-terminal-error/test_seek_failure.py.
+This closes a source-proven error route, not an attributed #331 root cause.
+---
+diff --git a/dlls/mf/session.c b/dlls/mf/session.c
+index ff9f4848ecd1718ae45a740e37b3bb25d0fd4f5e..3ab73656ea0f0fc159537ed5e9ec4f3e7e3420d6 100644
+--- a/dlls/mf/session.c
++++ b/dlls/mf/session.c
+@@ -134,6 +134,7 @@ enum object_state
+ enum media_source_flags
+ {
+     SOURCE_FLAG_END_OF_PRESENTATION = 0x1,
++    SOURCE_FLAG_TERMINAL_ERROR_FORWARDED = 0x2,
+ };
+ 
+ struct media_source
+@@ -4877,13 +4878,44 @@ static HRESULT WINAPI session_events_callback_Invoke(IMFAsyncCallback *iface, IM
+         }
+ 
+         case MEError:
++        {
++            struct media_source *session_source;
++
+             /* Wine-specific extension */
+             EnterCriticalSection(&session->cs);
+-            if (SUCCEEDED(IMFMediaEvent_GetStatus(event, &hr)) && hr == MF_E_SHUTDOWN &&
+-                    session_get_media_source(session, (IMFMediaSource *)event_source))
+-                session_handle_source_shutdown(session);
++            if (SUCCEEDED(IMFMediaEvent_GetStatus(event, &hr)) &&
++                    (session_source = session_get_media_source(session, (IMFMediaSource *)event_source)))
++            {
++                if (hr == MF_E_SHUTDOWN)
++                    session_handle_source_shutdown(session);
++                else if (hr == MF_E_OPERATION_CANCELLED || hr == MF_E_NET_TIMEOUT
++                        || hr == MF_E_NET_READ || hr == MF_E_INVALID_POSITION)
++                {
++                    if (!(session_source->flags & SOURCE_FLAG_TERMINAL_ERROR_FORWARDED))
++                    {
++                        HRESULT queue_hr;
++
++                        queue_hr = IMFMediaEventQueue_QueueEventParamUnk(session->event_queue,
++                                MEError, &GUID_NULL, hr, (IUnknown *)(IMFMediaSource *)event_source);
++                        if (FAILED(queue_hr))
++                            WARN("Failed to forward source error %#lx, hr %#lx.\n", hr, queue_hr);
++                        else
++                            session_source->flags |= SOURCE_FLAG_TERMINAL_ERROR_FORWARDED;
++                    }
++
++                    /* A terminal source error replaces the missing
++                     * MESourceStarted/Seeked completion. Finish the command
++                     * without synthesizing MESessionStarted, which MediaEngine
++                     * would otherwise mistake for a successful seek. */
++                    if (session->command_state == COMMAND_STATE_STARTING_SOURCES
++                            || session->command_state == COMMAND_STATE_PREROLLING_SINKS
++                            || session->command_state == COMMAND_STATE_STARTING_SINKS)
++                        session_command_complete(session);
++                }
++            }
+             LeaveCriticalSection(&session->cs);
+             break;
++        }
+ 
+         default:
+             ;
+diff --git a/dlls/mfmediaengine/main.c b/dlls/mfmediaengine/main.c
+index de93198fd40d11a3ad5b382623eca3e76002d854..74c58023a338f05790dacf7ff2732140a380d097 100644
+--- a/dlls/mfmediaengine/main.c
++++ b/dlls/mfmediaengine/main.c
+@@ -205,6 +205,7 @@ struct media_engine
+     BSTR current_source;
+     struct
+     {
++        UINT64 generation;
+         IMFMediaSource *source;
+         IMFPresentationDescriptor *pd;
+         /* Pending MediaSession start state; always VT_EMPTY or VT_I8. */
+@@ -1203,6 +1204,54 @@ static HRESULT WINAPI media_engine_session_events_Invoke(IMFAsyncCallback *iface
+                 IMFMediaEngineNotify_EventNotify(engine->callback, MF_MEDIA_ENGINE_EVENT_ENDED, 0, 0);
+             break;
+ 
++        case MEError:
++        {
++            MF_MEDIA_ENGINE_ERR error_code;
++            PROPVARIANT source = {.vt = VT_EMPTY};
++            HRESULT error;
++
++            if (FAILED(IMFMediaEvent_GetStatus(event, &error)) ||
++                    (error != MF_E_OPERATION_CANCELLED && error != MF_E_NET_TIMEOUT
++                    && error != MF_E_NET_READ && error != MF_E_INVALID_POSITION) ||
++                    FAILED(IMFMediaEvent_GetValue(event, &source)) ||
++                    source.vt != VT_UNKNOWN || !source.punkVal)
++            {
++                PropVariantClear(&source);
++                break;
++            }
++
++            if (error == MF_E_OPERATION_CANCELLED)
++                error_code = MF_MEDIA_ENGINE_ERR_ABORTED;
++            else if (error == MF_E_INVALID_POSITION)
++                error_code = MF_MEDIA_ENGINE_ERR_DECODE;
++            else
++                error_code = MF_MEDIA_ENGINE_ERR_NETWORK;
++            EnterCriticalSection(&engine->cs);
++            if ((engine->flags & FLAGS_ENGINE_SHUT_DOWN)
++                    || engine->presentation.generation != engine->source_generation
++                    || source.punkVal != (IUnknown *)engine->presentation.source)
++            {
++                LeaveCriticalSection(&engine->cs);
++                PropVariantClear(&source);
++                break;
++            }
++            engine->error_code = error_code;
++            engine->extended_code = error;
++            engine->playback_requested = FALSE;
++            engine->current_seek = NAN;
++            engine->next_seek = NAN;
++            engine->deferred_seek = NAN;
++            media_engine_set_flag(engine, FLAGS_ENGINE_SEEKING | FLAGS_ENGINE_DEFERRED_SEEK
++                    | FLAGS_ENGINE_PLAY_PENDING | FLAGS_ENGINE_PAUSE_PENDING
++                    | FLAGS_ENGINE_WAITING | FLAGS_ENGINE_SCRUBBING, FALSE);
++            IMFMediaEngineNotify_EventNotify(engine->callback, MF_MEDIA_ENGINE_EVENT_ERROR,
++                    error_code, error);
++            LeaveCriticalSection(&engine->cs);
++
++            PropVariantClear(&source);
++            break;
++        }
++
+         case MEEndOfPresentation:
+             EnterCriticalSection(&engine->cs);
+             /* Media Engine users may wait on ended state before replacing the
+@@ -1556,6 +1605,7 @@ static void media_engine_clear_presentation(struct media_engine *engine)
+     /* Detach refcounted resources before dropping the lock.  A concurrent
+      * source load may install a new presentation while Shutdown() drains its
+      * callbacks; the old cleanup must never release or clear that new state. */
++    engine->presentation.generation = 0;
+     engine->presentation.source = NULL;
+     engine->presentation.pd = NULL;
+     engine->presentation.frame_sink = NULL;
+@@ -1675,6 +1725,7 @@ static HRESULT media_engine_create_topology(struct media_engine *engine, IMFMedi
+         return MF_E_OPERATION_CANCELLED;
+     }
+ 
++    engine->presentation.generation = generation;
+     engine->presentation.source = source;
+     IMFMediaSource_AddRef(engine->presentation.source);
+     engine->presentation.pd = pd;
+@@ -2146,6 +2197,8 @@ static HRESULT media_engine_set_source(struct media_engine *engine, IMFByteStrea
+ 
+     generation = ++engine->source_generation;
+ 
++    engine->error_code = MF_MEDIA_ENGINE_ERR_NOERROR;
++    engine->extended_code = S_OK;
+     SysFreeString(engine->current_source);
+     engine->current_source = NULL;
+     if (url)
+diff --git a/dlls/winedmo/media_source.c b/dlls/winedmo/media_source.c
+index b4bb72ae82f20575692dfbd505598018958f2c53..75906ce54d544d1ec0c386d6ff8d273927effbf8 100644
+--- a/dlls/winedmo/media_source.c
++++ b/dlls/winedmo/media_source.c
+@@ -351,6 +351,7 @@ struct media_source
+ 
+     CRITICAL_SECTION cs;
+     CRITICAL_SECTION demuxer_cs;
++    CRITICAL_SECTION demux_error_cs;
+     CONDITION_VARIABLE work_cv;
+     LONG pending_work_items;
+ 
+@@ -370,11 +371,13 @@ struct media_source
+     HANDLE demux_thread;
+     LONG demux_transition_epoch;
+     bool demux_thread_shutdown;
++    bool demux_seek_pending;
+     bool read_flushing;
+     bool flushing;
+     bool demux_eof;
+     bool eop_queued;
+     HRESULT demux_terminal_error;
++    LONG demux_error_event_generation;
+ 
+     IMFStreamDescriptor **descriptors;
+     struct media_stream **streams;
+@@ -442,6 +445,27 @@ static LONG media_source_get_demux_transition(struct media_source *source)
+     return InterlockedCompareExchange(&source->demux_transition_epoch, 0, 0);
+ }
+ 
++static HRESULT media_source_error_from_demux_status(NTSTATUS status)
++{
++    if (status == STATUS_CANCELLED)
++        return MF_E_OPERATION_CANCELLED;
++    if (status == STATUS_IO_TIMEOUT)
++        return MF_E_NET_TIMEOUT;
++    if (status == STATUS_CONNECTION_DISCONNECTED)
++        return MF_E_NET_READ;
++    return HRESULT_FROM_NT(status);
++}
++
++static HRESULT media_source_get_demux_error(struct media_source *source)
++{
++    return InterlockedCompareExchange(&source->demux_terminal_error, S_OK, S_OK);
++}
++
++static BOOL media_source_set_demux_error(struct media_source *source, HRESULT error)
++{
++    return InterlockedCompareExchange(&source->demux_terminal_error, error, S_OK) == S_OK;
++}
++
+ static inline struct media_source *impl_from_IMFGetService(IMFGetService *iface)
+ {
+     return CONTAINING_RECORD(iface, struct media_source, IMFGetService_iface);
+@@ -1005,11 +1029,14 @@ static HRESULT media_stream_start(struct media_stream *stream, BOOL active, BOOL
+             seeking ? MEStreamSeeked : MEStreamStarted, &GUID_NULL, S_OK, position);
+ }
+ 
++static BOOL media_source_queue_demux_error(struct media_source *source, HRESULT error);
++
+ static HRESULT media_source_start(struct media_source *source, IMFPresentationDescriptor *descriptor,
+-        GUID *format, PROPVARIANT *position)
++        GUID *format, PROPVARIANT *position, BOOL *error_queued)
+ {
+     BOOL starting = source->state == SOURCE_STOPPED, seek_message;
+     IMFStreamDescriptor **descriptors;
++    LONG error_event_generation;
+     NTSTATUS status = STATUS_SUCCESS;
+     DWORD i, count;
+     HRESULT hr;
+@@ -1017,10 +1044,13 @@ static HRESULT media_source_start(struct media_source *source, IMFPresentationDe
+     TRACE("source %p, descriptor %p, format %s, position %s\n", source, descriptor,
+             debugstr_guid(format), wine_dbgstr_variant((VARIANT *)position));
+ 
++    *error_queued = FALSE;
+     if (source->state == SOURCE_SHUTDOWN)
+         return MF_E_SHUTDOWN;
+-    if (FAILED(source->demux_terminal_error))
+-        return source->demux_terminal_error;
++    if (FAILED(hr = media_source_get_demux_error(source)))
++        return hr;
++    error_event_generation = InterlockedCompareExchange(
++            &source->demux_error_event_generation, 0, 0);
+ 
+     if (!source->seekable && position->vt != VT_EMPTY)
+     {
+@@ -1071,6 +1101,8 @@ static HRESULT media_source_start(struct media_source *source, IMFPresentationDe
+ 
+     if (position->vt == VT_I8)
+     {
++        HRESULT seek_error = S_OK;
++
+         /* Make every read from the old timeline distinguishable even if the
+          * complete flush begins and ends before that read returns. */
+         media_source_begin_demux_transition(source);
+@@ -1095,18 +1127,45 @@ static HRESULT media_source_start(struct media_source *source, IMFPresentationDe
+         if (!(status = winedmo_demuxer_set_cancelled(source->demuxer, TRUE)))
+         {
+             EnterCriticalSection(&source->demuxer_cs);
+-            if (!(status = winedmo_demuxer_set_cancelled(source->demuxer, FALSE)))
++            if (FAILED(seek_error = media_source_get_demux_error(source)))
++                status = STATUS_SUCCESS;
++            else if (!(status = winedmo_demuxer_set_cancelled(source->demuxer, FALSE)))
++            {
++                /* Let Shutdown acquire source->cs and trip the demuxer's
++                 * interrupt callback while a direct network seek is blocked.
++                 * The pending work-item count keeps this source alive, while
++                 * demux_seek_pending keeps other source commands serialized. */
++                source->demux_seek_pending = true;
++                LeaveCriticalSection(&source->cs);
+                 status = winedmo_demuxer_seek(source->demuxer, position->hVal.QuadPart);
++                EnterCriticalSection(&source->cs);
++                source->demux_seek_pending = false;
++                WakeAllConditionVariable(&source->work_cv);
++                if (!status && (source->state == SOURCE_SHUTDOWN
++                        || source->demux_thread_shutdown))
++                    status = STATUS_CANCELLED;
++            }
+             LeaveCriticalSection(&source->demuxer_cs);
+         }
+ 
+-        if (status)
++        if (FAILED(seek_error) || status)
+         {
++            HRESULT error = FAILED(seek_error) ? seek_error
++                    : media_source_error_from_demux_status(status);
++
+             /* Cancellation or seek failed after the old queues were flushed.
+              * Keep the epoch odd and stop the producer rather than retrying an
+              * unknown or damaged timeline. */
+-            source->demux_thread_shutdown = true;
+-            source->demux_terminal_error = HRESULT_FROM_NT(status);
++            if (error != MF_E_OPERATION_CANCELLED && error != MF_E_NET_TIMEOUT
++                    && error != MF_E_NET_READ)
++            {
++                WARN("Failed to establish seek position, original error %#lx; stopping source.\n", error);
++                error = MF_E_INVALID_POSITION;
++            }
++            *error_queued = media_source_queue_demux_error(source, error);
++            if (!*error_queued && error_event_generation != InterlockedCompareExchange(
++                    &source->demux_error_event_generation, 0, 0))
++                *error_queued = TRUE;
+             for (i = 0; i < source->stream_count; i++)
+             {
+                 struct media_stream *stream = source->streams[i];
+@@ -1115,8 +1174,8 @@ static HRESULT media_source_start(struct media_source *source, IMFPresentationDe
+                 ++stream->request_generation;
+                 stream->active = FALSE;
+                 stream->paused = FALSE;
+-                stream->eos = TRUE;
+-                stream->eos_epoch = media_source_get_demux_transition(source);
++                stream->eos = FALSE;
++                stream->eos_epoch = 0;
+                 WakeAllConditionVariable(&stream->queue_cv);
+                 LeaveCriticalSection(&stream->queue_cs);
+                 flush_token_queue(stream, FALSE);
+@@ -1129,15 +1188,30 @@ static HRESULT media_source_start(struct media_source *source, IMFPresentationDe
+             media_source_end_demux_transition(source);
+         }
+ 
+-        if (status)
++        if (FAILED(seek_error) || status)
+         {
+             for (i = 0; i < source->stream_count; i++)
+                 if (descriptors[i]) IMFStreamDescriptor_Release(descriptors[i]);
+             free(descriptors);
+-            return HRESULT_FROM_NT(status);
++            return media_source_get_demux_error(source);
+         }
+     }
+ 
++    /* Commit stream/source Started or Seeked events while terminal-error
++     * publication is excluded. This prevents an error claimed before commit
++     * from being followed by a stale successful source transition. */
++    EnterCriticalSection(&source->demux_error_cs);
++    if (FAILED(hr = media_source_get_demux_error(source)))
++    {
++        *error_queued = error_event_generation != InterlockedCompareExchange(
++                &source->demux_error_event_generation, 0, 0);
++        LeaveCriticalSection(&source->demux_error_cs);
++        for (i = 0; i < source->stream_count; i++)
++            if (descriptors[i]) IMFStreamDescriptor_Release(descriptors[i]);
++        free(descriptors);
++        return hr;
++    }
++
+     for (i = 0; i < source->stream_count; i++)
+     {
+         struct media_stream *stream = source->streams[i];
+@@ -1183,8 +1257,10 @@ static HRESULT media_source_start(struct media_source *source, IMFPresentationDe
+     for (i = 0; i < source->stream_count; i++)
+         flush_token_queue(source->streams[i], source->streams[i]->active);
+ 
+-    return IMFMediaEventQueue_QueueEventParamVar(source->event_queue,
++    hr = IMFMediaEventQueue_QueueEventParamVar(source->event_queue,
+             seek_message ? MESourceSeeked : MESourceStarted, &GUID_NULL, S_OK, position);
++    LeaveCriticalSection(&source->demux_error_cs);
++    return hr;
+ }
+ 
+ /* ========================================================================
+@@ -1419,6 +1495,13 @@ static HRESULT wait_on_sample(struct media_stream *stream, IUnknown **token, LON
+             return S_OK;
+         }
+ 
++        if (FAILED(hr = media_source_get_demux_error(source)))
++        {
++            if (pkt)
++                media_packet_free(pkt);
++            return hr;
++        }
++
+         if (pkt)
+         {
+             hr = media_stream_send_sample(stream, pkt, *token);
+@@ -1439,6 +1522,39 @@ static HRESULT wait_on_sample(struct media_stream *stream, IUnknown **token, LON
+  * Demux thread
+  * ======================================================================== */
+ 
++static BOOL media_source_queue_demux_error(struct media_source *source, HRESULT error)
++{
++    BOOL queued;
++    HRESULT hr;
++    UINT i;
++
++    EnterCriticalSection(&source->demux_error_cs);
++    if (!media_source_set_demux_error(source, error))
++    {
++        LeaveCriticalSection(&source->demux_error_cs);
++        return FALSE;
++    }
++
++    source->demux_thread_shutdown = true;
++    if (FAILED(hr = IMFMediaEventQueue_QueueEventParamVar(source->event_queue,
++            MEError, &GUID_NULL, error, NULL)))
++        WARN("Failed to queue demux error %#lx, hr %#lx.\n", error, hr);
++    else
++        InterlockedIncrement(&source->demux_error_event_generation);
++
++    for (i = 0; i < source->stream_count; ++i)
++    {
++        struct media_stream *stream = source->streams[i];
++
++        EnterCriticalSection(&stream->queue_cs);
++        WakeAllConditionVariable(&stream->queue_cv);
++        LeaveCriticalSection(&stream->queue_cs);
++    }
++    queued = SUCCEEDED(hr);
++    LeaveCriticalSection(&source->demux_error_cs);
++    return queued;
++}
++
+ static DWORD CALLBACK source_demux_thread(void *arg)
+ {
+     struct media_source *source = arg;
+@@ -1495,16 +1611,29 @@ static DWORD CALLBACK source_demux_thread(void *arg)
+             continue;
+         }
+         status = winedmo_demuxer_read(source->demuxer, &stream_idx, &output, &needed_size);
+-        LeaveCriticalSection(&source->demuxer_cs);
+ 
+-        /* A complete seek may begin and end before this read returns.  The
+-         * transition epoch detects that case even after flushing is clear. */
++        /* Claim a terminal network error while this lock still excludes a
++         * seek. A seek which began before this claim changes the transition
++         * epoch; demux_error_cs separately orders the claim against the final
++         * Started/Seeked event commit without covering a blocking read. */
+         if (read_epoch != media_source_get_demux_transition(source)
+                 || source->demux_thread_shutdown)
+         {
++            LeaveCriticalSection(&source->demuxer_cs);
+             IMediaBuffer_Release(&sbuf->IMediaBuffer_iface);
+             continue;
+         }
++        if (status == STATUS_CANCELLED || status == STATUS_IO_TIMEOUT
++                || status == STATUS_CONNECTION_DISCONNECTED)
++        {
++            HRESULT error = media_source_error_from_demux_status(status);
++
++            media_source_queue_demux_error(source, error);
++            LeaveCriticalSection(&source->demuxer_cs);
++            IMediaBuffer_Release(&sbuf->IMediaBuffer_iface);
++            break;
++        }
++        LeaveCriticalSection(&source->demuxer_cs);
+ 
+         if (status == STATUS_BUFFER_TOO_SMALL)
+         {
+@@ -1637,6 +1766,9 @@ static HRESULT WINAPI source_async_commands_Invoke(IMFAsyncCallback *iface, IMFA
+ 
+     EnterCriticalSection(&source->cs);
+ 
++    while (source->demux_seek_pending && source->state != SOURCE_SHUTDOWN)
++        SleepConditionVariableCS(&source->work_cv, &source->cs, INFINITE);
++
+     command = impl_from_async_command_IUnknown(state);
+     switch (command->op)
+     {
+@@ -1645,12 +1777,14 @@ static HRESULT WINAPI source_async_commands_Invoke(IMFAsyncCallback *iface, IMFA
+             IMFPresentationDescriptor *descriptor = command->u.start.descriptor;
+             GUID format = command->u.start.format;
+             PROPVARIANT position = command->u.start.position;
++            BOOL error_queued;
+ 
+-            if (FAILED(hr = media_source_start(source, descriptor, &format, &position)))
++            if (FAILED(hr = media_source_start(source, descriptor, &format, &position, &error_queued)))
+             {
+                 WARN("Failed to start source %p, hr %#lx\n", source, hr);
+-                IMFMediaEventQueue_QueueEventParamVar(source->event_queue, MEError,
+-                        &GUID_NULL, hr, NULL);
++                if (!error_queued)
++                    IMFMediaEventQueue_QueueEventParamVar(source->event_queue, MEError,
++                            &GUID_NULL, hr, NULL);
+             }
+             break;
+         }
+@@ -2263,6 +2397,8 @@ static ULONG WINAPI media_source_Release(IMFMediaSource *iface)
+         IMFMediaSource_Shutdown(iface);
+         IMFMediaEventQueue_Release(source->event_queue);
+         IMFByteStream_Release(source->byte_stream);
++        source->demux_error_cs.DebugInfo->Spare[0] = 0;
++        DeleteCriticalSection(&source->demux_error_cs);
+         source->demuxer_cs.DebugInfo->Spare[0] = 0;
+         DeleteCriticalSection(&source->demuxer_cs);
+         source->cs.DebugInfo->Spare[0] = 0;
+@@ -2608,6 +2744,8 @@ static HRESULT media_source_create(struct object_context *context, IMFMediaSourc
+     object->cs.DebugInfo->Spare[0] = (DWORD_PTR)(__FILE__ ": cs");
+     InitializeCriticalSectionEx(&object->demuxer_cs, 0, RTL_CRITICAL_SECTION_FLAG_FORCE_DEBUG_INFO);
+     object->demuxer_cs.DebugInfo->Spare[0] = (DWORD_PTR)(__FILE__ ": demuxer_cs");
++    InitializeCriticalSectionEx(&object->demux_error_cs, 0, RTL_CRITICAL_SECTION_FLAG_FORCE_DEBUG_INFO);
++    object->demux_error_cs.DebugInfo->Spare[0] = (DWORD_PTR)(__FILE__ ": demux_error_cs");
+     InitializeConditionVariable(&object->work_cv);
+ 
+     if (FAILED(hr = MFCreateEventQueue(&object->event_queue)))
+@@ -2744,6 +2882,8 @@ fail:
+     if (object->event_queue)
+         IMFMediaEventQueue_Release(object->event_queue);
+     IMFByteStream_Release(object->byte_stream);
++    object->demux_error_cs.DebugInfo->Spare[0] = 0;
++    DeleteCriticalSection(&object->demux_error_cs);
+     object->demuxer_cs.DebugInfo->Spare[0] = 0;
+     DeleteCriticalSection(&object->demuxer_cs);
+     object->cs.DebugInfo->Spare[0] = 0;
+diff --git a/dlls/winedmo/unix_demuxer.c b/dlls/winedmo/unix_demuxer.c
+index 0feee3bf0f7ed0c10418c4c48c1fed32edd58794..8913dec91d358445dcce019022fe9a1e57d9a9e9 100644
+--- a/dlls/winedmo/unix_demuxer.c
++++ b/dlls/winedmo/unix_demuxer.c
+@@ -23,6 +23,7 @@
+ #include "config.h"
+ #include "unix_private.h"
+ 
++#include <errno.h>
+ #include <strings.h>
+ 
+ #include "wine/debug.h"
+@@ -925,6 +926,8 @@ static char *normalize_rtsp_url( const char *url, enum direct_network_url kind )
+ 
+ static void demuxer_free_context( struct demuxer *demuxer )
+ {
++    av_packet_free( &demuxer->last_packet );
++    demuxer->last_stream = NULL;
+     if (!demuxer->ctx) return;
+ 
+     if (demuxer->direct_url)
+@@ -1210,6 +1213,7 @@ NTSTATUS demuxer_get_flags( void *arg )
+ static NTSTATUS demuxer_filter_packet( struct demuxer *demuxer, AVPacket **packet )
+ {
+     struct stream *stream;
++    BOOL input_error;
+     int i, ret;
+ 
+     if (demuxer->cancelled_read_pending_recovery) return STATUS_CANCELLED;
+@@ -1223,6 +1227,7 @@ static NTSTATUS demuxer_filter_packet( struct demuxer *demuxer, AVPacket **packe
+ 
+     do
+     {
++        input_error = FALSE;
+         if ((*packet = demuxer->last_packet)) return STATUS_SUCCESS;
+         if (!(*packet = av_packet_alloc())) return STATUS_NO_MEMORY;
+ 
+@@ -1241,6 +1246,7 @@ static NTSTATUS demuxer_filter_packet( struct demuxer *demuxer, AVPacket **packe
+             if (demuxer->io_timeout) demuxer_set_deadline( demuxer, demuxer->io_timeout );
+             ret = av_read_frame( demuxer->ctx, *packet );
+             if (demuxer->io_timeout) demuxer_set_deadline( demuxer, 0 );
++            input_error = ret < 0 && ret != AVERROR_EOF && ret != AVERROR(EAGAIN);
+             if (demuxer->require_avio_seek
+                     && __atomic_load_n( &demuxer->cancelled, __ATOMIC_ACQUIRE )
+                     && (ret == AVERROR_EXIT || (demuxer->ctx->pb
+@@ -1261,6 +1267,7 @@ static NTSTATUS demuxer_filter_packet( struct demuxer *demuxer, AVPacket **packe
+ 
+                 stream = demuxer->streams + (*packet)->stream_index;
+                 ret = av_bsf_send_packet( stream->filter, (*packet) );
++                input_error = FALSE;
+                 if (ret < 0) WARN( "Failed to send packet to filter, error %s.\n", debugstr_averr( ret ) );
+                 else demuxer->last_stream = stream;
+             }
+@@ -1283,7 +1290,13 @@ static NTSTATUS demuxer_filter_packet( struct demuxer *demuxer, AVPacket **packe
+     } while (!ret || ret == AVERROR(EAGAIN));
+ 
+     ERR( "Failed to read packet from demuxer %p, error %s.\n", demuxer, debugstr_averr( ret ) );
+-    return STATUS_END_OF_FILE;
++
++    /* Preserve the legacy local-bytestream behavior while keeping terminal
++     * failures on direct HTTP, HLS, and RTSP inputs distinct from clean EOF. */
++    if (!demuxer->direct_url || !input_error) return STATUS_END_OF_FILE;
++    if (__atomic_load_n( &demuxer->cancelled, __ATOMIC_ACQUIRE )) return STATUS_CANCELLED;
++    if (ret == AVERROR_EXIT || ret == AVERROR(ETIMEDOUT)) return STATUS_IO_TIMEOUT;
++    return STATUS_CONNECTION_DISCONNECTED;
+ }
+ 
+ NTSTATUS demuxer_read( void *arg )
+@@ -1388,14 +1401,23 @@ NTSTATUS demuxer_seek( void *arg )
+     if (demuxer->io_timeout) demuxer_set_deadline( demuxer, demuxer->io_timeout );
+     ret = avformat_seek_file( demuxer->ctx, -1, INT64_MIN, timestamp, timestamp, AVSEEK_FLAG_BACKWARD );
+     if (demuxer->io_timeout) demuxer_set_deadline( demuxer, 0 );
++    if (ret == AVERROR_EOF && demuxer->direct_url && demuxer->require_avio_seek)
++        goto done;
+     if (ret < 0)
+     {
+         ERR( "Failed to seek demuxer %p, error %s.\n", demuxer, debugstr_averr(ret) );
++        if (demuxer->direct_url && demuxer->require_avio_seek)
++        {
++            if (__atomic_load_n( &demuxer->cancelled, __ATOMIC_ACQUIRE ))
++                return STATUS_CANCELLED;
++            if (ret == AVERROR_EXIT || ret == AVERROR(ETIMEDOUT))
++                return STATUS_IO_TIMEOUT;
++            return STATUS_CONNECTION_DISCONNECTED;
++        }
+         return STATUS_UNSUCCESSFUL;
+     }
+-    demuxer->cancelled_read_pending_recovery = FALSE;
+-
+ done:
++    demuxer->cancelled_read_pending_recovery = FALSE;
+     for (i = 0; i < demuxer->ctx->nb_streams; i++)
+     {
+         av_bsf_flush( demuxer->streams[i].filter );
+@@ -1411,6 +1433,27 @@ done:
+     av_packet_free( &demuxer->last_packet );
+     demuxer->last_stream = NULL;
+ 
++    /* MOV defers the HTTP Range reopen until its first packet read.  Validate
++     * that read before reporting a completed seek and retain the packet for
++     * the normal demux path.  A seek to the known end remains ordinary EOS. */
++    if (demuxer->require_avio_seek
++            && (demuxer->duration <= 0 || params->timestamp < demuxer->duration))
++    {
++        AVPacket *packet = NULL;
++
++        if ((status = demuxer_filter_packet( demuxer, &packet )))
++        {
++            /* An unknown-duration seek may legitimately land at EOF.  Let the
++             * normal read path publish EOS instead of making Start fail. A
++             * known-duration premature EOF is a truncated network response. */
++            if (status == STATUS_END_OF_FILE)
++                return demuxer->duration <= 0 ? STATUS_SUCCESS
++                        : STATUS_CONNECTION_DISCONNECTED;
++            return status;
++        }
++        demuxer->last_packet = packet;
++    }
++
+     return STATUS_SUCCESS;
+ }
+ 

@@ -1,0 +1,81 @@
+{
+  "audio_check_labels": [
+    "join-offset-steady"
+  ],
+  "checkpoint_expectations": [
+    {
+      "action": "snapshot",
+      "ended": false,
+      "has_audio": true,
+      "has_video": true,
+      "label": "join-offset-steady",
+      "max_matches": 1,
+      "max_time": 49.5,
+      "max_timeline_generation": 2,
+      "min_matches": 1,
+      "min_time": 48.2,
+      "min_timeline_generation": 2,
+      "paused": false,
+      "seeking": false
+    }
+  ],
+  "event_order": [
+    "CANPLAY",
+    "PLAYING"
+  ],
+  "expected_driver_sha256": "70ba4f15f8d96a0890555ff1847050d7a45ebe1efe6479c42dd62a0cb22e808a",
+  "expected_exit_code": 0,
+  "expected_result": "pass",
+  "expected_scenario_sha256": "45c265ade8e4344add9e74754ac2e8464ddfdb570d2f93642b0026667e0fd887",
+  "forbidden_events": [
+    "ERROR",
+    "STREAMRENDERINGERROR"
+  ],
+  "max_audio_nonzero_silence_ms": 750,
+  "max_audio_silence_ms": 750,
+  "max_media_error_events": 0,
+  "max_time_regression": 0.1,
+  "max_timeout_snapshots": 0,
+  "min_action_counts": {
+    "seek": 1,
+    "snapshot": 1,
+    "wait_time": 1
+  },
+  "min_audio_bytes_generation": 4096,
+  "min_audio_nonzero_units_generation": 20,
+  "min_audio_samples_generation": 10,
+  "min_playback_advance": 0.75,
+  "min_post_seek_advance": 0.75,
+  "min_post_seek_audio_bytes": 4096,
+  "min_post_seek_audio_samples": 10,
+  "min_post_seek_nonzero_units": 20,
+  "min_source_generations": 1,
+  "require_audio_each_generation": true,
+  "require_av_same_snapshot_each_generation": true,
+  "require_seek_completion": true,
+  "require_video_each_generation": true,
+  "required_actions": [
+    "load",
+    "seek",
+    "play",
+    "snapshot",
+    "shutdown"
+  ],
+  "required_audio_payload_formats": [
+    "pcm16",
+    "pcm32",
+    "float32"
+  ],
+  "required_events": [
+    "CANPLAY",
+    "SEEKED",
+    "PLAYING"
+  ],
+  "required_events_per_generation": [
+    "CANPLAY"
+  ],
+  "required_seek_targets": [
+    47.25
+  ],
+  "seek_target_tolerance": 0.5
+}

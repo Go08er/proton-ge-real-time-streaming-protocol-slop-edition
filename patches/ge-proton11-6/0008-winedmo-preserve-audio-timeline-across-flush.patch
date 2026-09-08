@@ -1,0 +1,51 @@
+From 6b32e2a909a332920625a439d8c969afeb9a842e Mon Sep 17 00:00:00 2001
+From: RTSP-on-GE11 contributors <noreply@invalid>
+Date: Fri, 17 Jul 2026 10:30:00 -0500
+Subject: [PATCH 8/8] winedmo: preserve audio timeline across decoder flush
+
+GE's audio decoder used audio_started both to mark the first output sample
+and to decide when to establish the output timestamp origin. A Media
+Foundation seek flushes the transform and cleared both audio_started and the
+established origin. The first decoded AAC sample after a nonzero seek was
+therefore rebased from its absolute source timestamp to zero, while the media
+session continued comparing samples against the absolute seek position. The
+session discarded the entire remaining audio stream as pre-roll and starved
+the shared A/V demux path.
+
+Use the timestamp-adjust sentinel together with the existing first-output
+guard to decide whether the origin still needs to be established. Preserve
+both fields in the established input-to-output timestamp mapping across a
+decoder flush. The flush still clears decoder and accumulation state and marks
+the first subsequent output as discontinuous. Transform creation and GE's
+existing explicit-input-discontinuity path continue to clear the mapping.
+
+The license of the modified Wine source file applies to this patch.
+
+A3.19: rebased after GE-Proton11-6's ge-video-rework set.
+---
+diff --git a/dlls/winedmo/unix_transform.c b/dlls/winedmo/unix_transform.c
+index c5111ee11f741efdbbfd44648edae802874e45a2..b4288a7c3f89c2f395ff4c2dc51cf241c9b384ed 100644
+--- a/dlls/winedmo/unix_transform.c
++++ b/dlls/winedmo/unix_transform.c
+@@ -1457,7 +1457,8 @@ NTSTATUS transform_get_output( void *arg )
+          * (legacy PROVIDES_SAMPLES query) get STATUS_BUFFER_TOO_SMALL with the full
+          * size; all other callers receive up to capacity bytes with INCOMPLETE set when
+          * more data remains. */
+-        if (!t->audio_started && base_pts != INT64_MIN
++        if (!t->audio_started && t->audio_output_pts_adjust == INT64_MIN
++                && base_pts != INT64_MIN
+                 && (t->avctx->codec_id != AV_CODEC_ID_AAC || !t->split_aac_output))
+             t->audio_output_pts_adjust = base_pts;
+         if (base_pts != INT64_MIN && t->audio_output_pts_adjust != INT64_MIN)
+@@ -1598,8 +1599,9 @@ NTSTATUS transform_flush( void *arg )
+     t->video_trace_count  = 0;
+     t->audio_base_pts     = 0;
+     t->last_input_pts     = INT64_MIN;
+-    t->audio_pts_offset   = 0;
+-    t->audio_output_pts_adjust = INT64_MIN;
++    /* Keep the established input-to-output timestamp mapping across a decoder
++     * flush. Discarding queued decode state does not start a new presentation
++     * timeline; explicit input-discontinuity handling remains separate. */
+     t->audio_started      = false;
+     t->last_video_pts     = INT64_MIN;
+     t->last_video_duration = INT64_MIN;

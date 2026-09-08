@@ -1,0 +1,601 @@
+From a3dd7362b047968eecaa092c9d47f37c0c172e64 Mon Sep 17 00:00:00 2001
+From: RTSP-on-GE diagnostics <rtsp-on-ge@example.invalid>
+Date: Mon, 20 Jul 2026 20:55:49 -0500
+Subject: [PATCH] mf: trace AVPro audio gate and effect input
+
+---
+ dlls/mf/session.c         | 305 +++++++++++++++++++++++++++++++++++++-
+ dlls/mfmediaengine/main.c | 114 +++++++++++++-
+ 2 files changed, 414 insertions(+), 5 deletions(-)
+
+diff --git a/dlls/mf/session.c b/dlls/mf/session.c
+index 175d143..62b4859 100644
+--- a/dlls/mf/session.c
++++ b/dlls/mf/session.c
+@@ -39,6 +39,10 @@
+ DEFINE_GUID(_MF_TOPONODE_IMFActivate, 0x33706f4a, 0x309a, 0x49be, 0xa8, 0xdd, 0xe7, 0xc0, 0x87, 0x5e, 0xb6, 0x79);
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(mfplat);
++WINE_DECLARE_DEBUG_CHANNEL(pcmprobe);
++
++#define PCM_PROBE_SAMPLE_LIMIT 16
++#define PCM_PROBE_VALUE_LIMIT 16384
+ 
+ enum session_command
+ {
+@@ -189,6 +193,43 @@ enum topo_node_flags
+     TOPO_NODE_TRANSFORM_NEEDS_INPUT = 0x8,
+ };
+ 
++enum pcm_probe_kind
++{
++    PCM_PROBE_NONE,
++    PCM_PROBE_AAC_DECODER,
++    PCM_PROBE_MEDIA_ENGINE_EFFECT,
++};
++
++struct pcm_probe_summary
++{
++    const char *kind;
++    const char *format;
++    const char *inspection_status;
++    IMFMediaSession *session;
++    TOPOID node_id;
++    unsigned int sequence;
++    UINT stream_index;
++    HRESULT inspection_hr;
++    UINT32 bits;
++    UINT32 channels;
++    UINT32 sample_rate;
++    DWORD buffer_count;
++    DWORD length;
++    BOOL have_pts;
++    LONGLONG pts;
++    BOOL have_duration;
++    LONGLONG duration;
++    DWORD total_values;
++    DWORD inspected_values;
++    DWORD total_frames;
++    DWORD inspected_frames;
++    BOOL truncated;
++    DWORD nonzero;
++    double peak;
++    double mean_square;
++    DWORD nonfinite;
++};
++
+ struct topo_node
+ {
+     struct list entry;
+@@ -198,6 +239,8 @@ struct topo_node
+     IMFTopologyNode *node;
+     enum object_state state;
+     unsigned int flags;
++    enum pcm_probe_kind pcm_probe_kind;
++    unsigned int pcm_probe_count;
+     union
+     {
+         IMFMediaStream *source_stream;
+@@ -1956,8 +1999,11 @@ static HRESULT session_append_node(struct media_session *session, IMFTopologyNod
+     struct topo_node *topo_node;
+     IMFMediaSink *media_sink;
+     IMFMediaType *media_type;
++    GUID object_id;
+     IMFStreamDescriptor *sd;
+     HRESULT hr = S_OK;
++    BOOL raw_audio_effect;
++    UINT i;
+     UINT32 value;
+ 
+     if (!(topo_node = calloc(1, sizeof(*topo_node))))
+@@ -2048,9 +2094,27 @@ static HRESULT session_append_node(struct media_session *session, IMFTopologyNod
+             break;
+         case MF_TOPOLOGY_TRANSFORM_NODE:
+ 
++            if (TRACE_ON(pcmprobe))
++            {
++                if (SUCCEEDED(IMFTopologyNode_GetGUID(node, &MF_TOPONODE_TRANSFORM_OBJECTID, &object_id)) &&
++                        IsEqualGUID(&object_id, &CLSID_MSAACDecMFT))
++                    topo_node->pcm_probe_kind = PCM_PROBE_AAC_DECODER;
++                else if (SUCCEEDED(IMFTopologyNode_GetUINT32(node, &MF_TOPONODE_NOSHUTDOWN_ON_REMOVE, &value)))
++                    topo_node->pcm_probe_kind = PCM_PROBE_MEDIA_ENGINE_EFFECT;
++            }
++
+             if (SUCCEEDED(hr = topology_node_get_object(node, &IID_IMFTransform, (void **)&topo_node->object.transform)))
+             {
+                 hr = session_set_transform_stream_info(topo_node);
++
++                if (SUCCEEDED(hr) && topo_node->pcm_probe_kind == PCM_PROBE_MEDIA_ENGINE_EFFECT)
++                {
++                    raw_audio_effect = FALSE;
++                    for (i = 0; i < topo_node->u.transform.output_count; ++i)
++                        raw_audio_effect |= topo_node->u.transform.outputs[i].raw_audio;
++                    if (!raw_audio_effect)
++                        topo_node->pcm_probe_kind = PCM_PROBE_NONE;
++                }
+             }
+             else
+                 WARN("Failed to get IMFTransform for MFT node, hr %#lx.\n", hr);
+@@ -3839,6 +3903,208 @@ static BOOL transform_node_markin_need_more_input(const struct media_session *se
+     return need_more_input;
+ }
+ 
++static BOOL inspect_pcm_probe_sample(struct topo_node *node, BOOL output, UINT stream_index,
++        IMFSample *sample, struct pcm_probe_summary *summary)
++{
++    DWORD buffer_count = 0, length = 0, total_values = 0, inspected_values = 0;
++    DWORD total_frames = 0, inspected_frames = 0;
++    DWORD nonzero = 0, nonfinite = 0, i, stream_id;
++    const char *kind, *format = "unsupported", *inspection_status = "failed";
++    UINT32 bits = 0, channels = 0, sample_rate = 0;
++    double sum_square = 0.0, peak = 0.0, mean_square = 0.0;
++    IMFMediaType *media_type = NULL;
++    IMFMediaBuffer *buffer = NULL;
++    LONGLONG pts = 0, duration = 0;
++    BOOL have_pts, have_duration;
++    GUID subtype = {0};
++    BYTE *data = NULL;
++    BOOL locked = FALSE, truncated = FALSE;
++    DWORD scalar_size = 0;
++    HRESULT inspection_hr = E_FAIL;
++
++    if (!TRACE_ON(pcmprobe) || node->pcm_probe_kind == PCM_PROBE_NONE ||
++            node->pcm_probe_count >= PCM_PROBE_SAMPLE_LIMIT)
++        return FALSE;
++    if ((node->pcm_probe_kind == PCM_PROBE_AAC_DECODER && !output) ||
++            (node->pcm_probe_kind == PCM_PROBE_MEDIA_ENGINE_EFFECT && output))
++        return FALSE;
++
++    memset(summary, 0, sizeof(*summary));
++    summary->sequence = node->pcm_probe_count++;
++    kind = output ? "aac_decoder_output" : "media_engine_audio_effect_input";
++    have_pts = SUCCEEDED(IMFSample_GetSampleTime(sample, &pts));
++    have_duration = SUCCEEDED(IMFSample_GetSampleDuration(sample, &duration));
++    stream_id = transform_node_get_stream_id(node, output, stream_index);
++
++    if (output)
++        inspection_hr = IMFTransform_GetOutputCurrentType(node->object.transform, stream_id, &media_type);
++    else
++        inspection_hr = IMFTransform_GetInputCurrentType(node->object.transform, stream_id, &media_type);
++    if (FAILED(inspection_hr))
++        goto done;
++
++    IMFMediaType_GetGUID(media_type, &MF_MT_SUBTYPE, &subtype);
++    IMFMediaType_GetUINT32(media_type, &MF_MT_AUDIO_BITS_PER_SAMPLE, &bits);
++    IMFMediaType_GetUINT32(media_type, &MF_MT_AUDIO_NUM_CHANNELS, &channels);
++    IMFMediaType_GetUINT32(media_type, &MF_MT_AUDIO_SAMPLES_PER_SECOND, &sample_rate);
++
++    if (IsEqualGUID(&subtype, &MFAudioFormat_Float) && bits == 32)
++    {
++        format = "f32";
++        scalar_size = sizeof(float);
++    }
++    else if (IsEqualGUID(&subtype, &MFAudioFormat_PCM) && bits == 16)
++    {
++        format = "s16";
++        scalar_size = sizeof(INT16);
++    }
++    else
++    {
++        inspection_status = "unsupported";
++        inspection_hr = MF_E_INVALIDMEDIATYPE;
++        goto done;
++    }
++
++    if (FAILED(inspection_hr = IMFSample_GetBufferCount(sample, &buffer_count)))
++        goto done;
++    if (buffer_count != 1)
++    {
++        inspection_status = "unsupported_buffers";
++        inspection_hr = E_NOTIMPL;
++        goto done;
++    }
++    if (FAILED(inspection_hr = IMFSample_GetBufferByIndex(sample, 0, &buffer)))
++        goto done;
++    if (FAILED(inspection_hr = IMFMediaBuffer_Lock(buffer, &data, NULL, &length)))
++        goto done;
++    locked = TRUE;
++
++    if (!channels || !sample_rate || length % scalar_size)
++    {
++        inspection_status = "invalid";
++        inspection_hr = MF_E_INVALIDMEDIATYPE;
++        goto done;
++    }
++
++    total_values = length / scalar_size;
++    inspected_values = min(total_values, PCM_PROBE_VALUE_LIMIT);
++    truncated = inspected_values != total_values;
++    inspection_status = inspected_values == total_values ? "complete" : "truncated";
++    inspection_hr = S_OK;
++
++    if (format[0] == 'f')
++    {
++        for (i = 0; i < inspected_values; ++i)
++        {
++            double magnitude;
++            float value;
++
++            memcpy(&value, data + i * sizeof(value), sizeof(value));
++            if (!isfinite(value))
++            {
++                ++nonfinite;
++                continue;
++            }
++
++            magnitude = value;
++            if (magnitude < 0.0)
++                magnitude = -magnitude;
++            if (magnitude != 0.0)
++                ++nonzero;
++            if (magnitude > peak)
++                peak = magnitude;
++            sum_square += magnitude * magnitude;
++        }
++    }
++    else if (format[0] == 's')
++    {
++        for (i = 0; i < inspected_values; ++i)
++        {
++            double magnitude;
++            INT16 value;
++
++            memcpy(&value, data + i * sizeof(value), sizeof(value));
++            magnitude = (double)value / 32768.0;
++            if (magnitude < 0.0)
++                magnitude = -magnitude;
++            if (magnitude != 0.0)
++                ++nonzero;
++            if (magnitude > peak)
++                peak = magnitude;
++            sum_square += magnitude * magnitude;
++        }
++    }
++
++done:
++    if (locked)
++        IMFMediaBuffer_Unlock(buffer);
++    if (buffer)
++        IMFMediaBuffer_Release(buffer);
++    if (media_type)
++        IMFMediaType_Release(media_type);
++
++    if (inspected_values > nonfinite)
++        mean_square = sum_square / (inspected_values - nonfinite);
++    if (channels)
++    {
++        total_frames = total_values / channels;
++        inspected_frames = inspected_values / channels;
++    }
++
++    summary->kind = kind;
++    summary->format = format;
++    summary->inspection_status = inspection_status;
++    summary->session = &node->session->IMFMediaSession_iface;
++    summary->node_id = node->node_id;
++    summary->stream_index = stream_index;
++    summary->inspection_hr = inspection_hr;
++    summary->bits = bits;
++    summary->channels = channels;
++    summary->sample_rate = sample_rate;
++    summary->buffer_count = buffer_count;
++    summary->length = length;
++    summary->have_pts = have_pts;
++    summary->pts = pts;
++    summary->have_duration = have_duration;
++    summary->duration = duration;
++    summary->total_values = total_values;
++    summary->inspected_values = inspected_values;
++    summary->total_frames = total_frames;
++    summary->inspected_frames = inspected_frames;
++    summary->truncated = truncated;
++    summary->nonzero = nonzero;
++    summary->peak = peak;
++    summary->mean_square = mean_square;
++    summary->nonfinite = nonfinite;
++
++    return TRUE;
++}
++
++static void trace_pcm_probe_summary(const struct pcm_probe_summary *summary, BOOL process_valid,
++        HRESULT process_hr, BOOL queue_attempted, HRESULT queue_hr,
++        BOOL delivery_valid, HRESULT delivery_hr)
++{
++    TRACE_(pcmprobe)("kind %s, session %p, node %s, seq %u, stream %u, status %s, hr %#lx, "
++            "format %s/%u, channels %u, rate %u, "
++            "buffers %lu, bytes %lu, pts_valid %d, pts %s, duration_valid %d, duration %s, "
++            "total_values %lu, inspected_values %lu, total_frames %lu, inspected_frames %lu, "
++            "truncated %d, nonzero %lu, peak %.9g, mean_square %.9g, nonfinite %lu, "
++            "process_valid %d, process_hr %#lx, queue_attempted %d, queue_hr %#lx, "
++            "delivery_valid %d, delivery_hr %#lx, accepted %d, queued %d.\n",
++            summary->kind, summary->session,
++            wine_dbgstr_longlong(summary->node_id), summary->sequence, summary->stream_index,
++            summary->inspection_status, summary->inspection_hr,
++            summary->format, summary->bits, summary->channels, summary->sample_rate,
++            summary->buffer_count, summary->length, summary->have_pts,
++            wine_dbgstr_longlong(summary->pts), summary->have_duration,
++            wine_dbgstr_longlong(summary->duration), summary->total_values,
++            summary->inspected_values, summary->total_frames, summary->inspected_frames,
++            summary->truncated, summary->nonzero, summary->peak, summary->mean_square,
++            summary->nonfinite, process_valid, process_hr, queue_attempted, queue_hr,
++            delivery_valid, delivery_hr, process_valid && SUCCEEDED(process_hr),
++            queue_attempted && SUCCEEDED(queue_hr));
++}
++
+ static HRESULT transform_node_pull_samples(const struct media_session *session, struct topo_node *node)
+ {
+     MFT_OUTPUT_DATA_BUFFER *buffers;
+@@ -3866,6 +4132,21 @@ static HRESULT transform_node_pull_samples(const struct media_session *session,
+ 
+             hr = IMFTransform_ProcessOutput(node->object.transform, 0, node->u.transform.output_count, buffers, &status);
+         }
++
++        if (TRACE_ON(pcmprobe) && hr == S_OK && node->pcm_probe_kind == PCM_PROBE_AAC_DECODER)
++        {
++            for (i = 0; i < node->u.transform.output_count; ++i)
++            {
++                struct pcm_probe_summary summary;
++
++                if (buffers[i].pSample && !(buffers[i].dwStatus & MFT_OUTPUT_DATA_BUFFER_NO_SAMPLE))
++                {
++                    if (inspect_pcm_probe_sample(node, TRUE, i, buffers[i].pSample, &summary))
++                        trace_pcm_probe_summary(&summary, FALSE, E_NOTIMPL, FALSE, E_NOTIMPL,
++                                FALSE, E_NOTIMPL);
++                }
++            }
++        }
+     }
+     while (hr == S_OK && transform_node_markin_need_more_input(session, node, buffers));
+ 
+@@ -3936,15 +4217,31 @@ static HRESULT transform_node_push_sample(const struct media_session *session, s
+     struct transform_stream *stream = &topo_node->u.transform.inputs[input];
+     UINT id = transform_node_get_stream_id(topo_node, FALSE, input);
+     IMFTransform *transform = topo_node->object.transform;
++    BOOL probe_inspected = FALSE, queue_attempted = FALSE;
++    struct pcm_probe_summary probe_summary;
++    HRESULT queue_hr = E_NOTIMPL;
++    HRESULT process_hr;
+     HRESULT hr;
+ 
+     if (sample)
+     {
+-        hr = IMFTransform_ProcessInput(transform, id, sample, 0);
+-        if (SUCCEEDED(hr))
++        if (TRACE_ON(pcmprobe) && topo_node->pcm_probe_kind == PCM_PROBE_MEDIA_ENGINE_EFFECT)
++            probe_inspected = inspect_pcm_probe_sample(topo_node, FALSE, input, sample, &probe_summary);
++
++        process_hr = IMFTransform_ProcessInput(transform, id, sample, 0);
++        hr = process_hr;
++        if (SUCCEEDED(process_hr))
+             topo_node->flags &= ~TOPO_NODE_TRANSFORM_NEEDS_INPUT;
+-        if (hr == MF_E_NOTACCEPTING)
+-            hr = transform_stream_push_sample(stream, sample);
++        if (process_hr == MF_E_NOTACCEPTING)
++        {
++            queue_attempted = TRUE;
++            queue_hr = transform_stream_push_sample(stream, sample);
++            hr = queue_hr;
++        }
++
++        if (probe_inspected)
++            trace_pcm_probe_summary(&probe_summary, TRUE, process_hr, queue_attempted, queue_hr,
++                    TRUE, hr);
+     }
+     else
+     {
+diff --git a/dlls/mfmediaengine/main.c b/dlls/mfmediaengine/main.c
+index 04fb994..9ae4fc6 100644
+--- a/dlls/mfmediaengine/main.c
++++ b/dlls/mfmediaengine/main.c
+@@ -39,6 +39,7 @@
+ #include "wine/debug.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(mfplat);
++WINE_DECLARE_DEBUG_CHANNEL(avprostate);
+ 
+ static BOOL mf_array_reserve(void **elements, size_t *capacity, size_t count, size_t size)
+ {
+@@ -2362,25 +2363,51 @@ static USHORT WINAPI media_engine_GetReadyState(IMFMediaEngineEx *iface)
+ static BOOL WINAPI media_engine_IsSeeking(IMFMediaEngineEx *iface)
+ {
+     struct media_engine *engine = impl_from_IMFMediaEngineEx(iface);
++    IMFMediaSession *session;
++    UINT64 source_generation;
++    unsigned int flags;
+     BOOL value;
+ 
+     EnterCriticalSection(&engine->cs);
+     value = !!(engine->flags & (FLAGS_ENGINE_SEEKING | FLAGS_ENGINE_DEFERRED_SEEK));
+     TRACE("%p returning %d flags %#x.\n", iface, value, engine->flags);
++    source_generation = engine->source_generation;
++    session = engine->session;
++    flags = engine->flags;
+     LeaveCriticalSection(&engine->cs);
+ 
++    TRACE_(avprostate)("engine %p, session %p, source_gen %s, call IsSeeking, "
++            "return %d, flags %#x, real %d, deferred %d.\n", iface, session,
++            wine_dbgstr_longlong(source_generation), value, flags,
++            !!(flags & FLAGS_ENGINE_SEEKING), !!(flags & FLAGS_ENGINE_DEFERRED_SEEK));
++
+     return value;
+ }
+ 
+ static double WINAPI media_engine_GetCurrentTime(IMFMediaEngineEx *iface)
+ {
+     struct media_engine *engine = impl_from_IMFMediaEngineEx(iface);
++    HRESULT deferred_flush_hr = E_NOTIMPL;
++    BOOL deferred_flush_attempted = FALSE;
++    double current_target_before, deferred_target_before;
++    double current_target_after, deferred_target_after;
++    BOOL deferred_work_before, deferred_work_after;
++    IMFMediaSession *session;
++    UINT64 source_generation;
++    unsigned int flags_before, flags_after;
+     double ret = 0.0;
+     MFTIME clocktime;
+ 
+     EnterCriticalSection(&engine->cs);
++    flags_before = engine->flags;
++    current_target_before = engine->current_seek;
++    deferred_target_before = engine->deferred_seek;
++    deferred_work_before = engine->deferred_seek_work_scheduled;
+     if ((engine->flags & FLAGS_ENGINE_DEFERRED_SEEK) && GetTickCount() - engine->deferred_seek_time >= 250)
+-        media_engine_flush_deferred_seek(engine);
++    {
++        deferred_flush_attempted = TRUE;
++        deferred_flush_hr = media_engine_flush_deferred_seek(engine);
++    }
+ 
+     if ((engine->flags & FLAGS_ENGINE_SEEKING) && isfinite(engine->current_seek))
+     {
+@@ -2426,8 +2453,27 @@ static double WINAPI media_engine_GetCurrentTime(IMFMediaEngineEx *iface)
+             engine->presentation.start_position.vt,
+             wine_dbgstr_longlong(engine->presentation.start_position.vt == VT_I8
+                     ? engine->presentation.start_position.hVal.QuadPart : 0));
++    source_generation = engine->source_generation;
++    session = engine->session;
++    flags_after = engine->flags;
++    deferred_work_after = engine->deferred_seek_work_scheduled;
++    current_target_after = engine->current_seek;
++    deferred_target_after = engine->deferred_seek;
+     LeaveCriticalSection(&engine->cs);
+ 
++    TRACE_(avprostate)("engine %p, session %p, source_gen %s, call GetCurrentTime, return %.6f, "
++            "flags_before %#x, flags_after %#x, real_after %d, deferred_after %d, "
++            "deferred_flush_attempted %d, deferred_flush_hr %#lx, "
++            "deferred_work_before %d, deferred_work_after %d, "
++            "current_target_before %.6f, current_target_after %.6f, "
++            "deferred_target_before %.6f, deferred_target_after %.6f.\n",
++            iface, session, wine_dbgstr_longlong(source_generation), ret, flags_before, flags_after,
++            !!(flags_after & FLAGS_ENGINE_SEEKING),
++            !!(flags_after & FLAGS_ENGINE_DEFERRED_SEEK), deferred_flush_attempted,
++            deferred_flush_hr, deferred_work_before, deferred_work_after,
++            current_target_before, current_target_after, deferred_target_before,
++            deferred_target_after);
++
+     return ret;
+ }
+ 
+@@ -2665,11 +2711,21 @@ static HRESULT media_engine_defer_current_time(struct media_engine *engine, doub
+ static HRESULT WINAPI media_engine_SetCurrentTime(IMFMediaEngineEx *iface, double time)
+ {
+     struct media_engine *engine = impl_from_IMFMediaEngineEx(iface);
++    double current_target_before, current_target_after;
++    double deferred_target_before, deferred_target_after;
++    BOOL deferred_work_before, deferred_work_after;
++    IMFMediaSession *session;
++    UINT64 source_generation;
++    unsigned int flags_before, flags_after;
+     HRESULT hr;
+ 
+     TRACE("%p, %f.\n", iface, time);
+ 
+     EnterCriticalSection(&engine->cs);
++    flags_before = engine->flags;
++    current_target_before = engine->current_seek;
++    deferred_target_before = engine->deferred_seek;
++    deferred_work_before = engine->deferred_seek_work_scheduled;
+ 
+     if (engine->flags & FLAGS_ENGINE_SHUT_DOWN)
+         hr = MF_E_SHUTDOWN;
+@@ -2680,8 +2736,26 @@ static HRESULT WINAPI media_engine_SetCurrentTime(IMFMediaEngineEx *iface, doubl
+         hr = media_engine_set_current_time(engine, time);
+     }
+ 
++    source_generation = engine->source_generation;
++    session = engine->session;
++    flags_after = engine->flags;
++    current_target_after = engine->current_seek;
++    deferred_target_after = engine->deferred_seek;
++    deferred_work_after = engine->deferred_seek_work_scheduled;
+     LeaveCriticalSection(&engine->cs);
+ 
++    TRACE_(avprostate)("engine %p, session %p, source_gen %s, call SetCurrentTime, "
++            "target %.6f, hr %#lx, "
++            "flags_before %#x, flags_after %#x, real_after %d, deferred_after %d, "
++            "deferred_work_before %d, deferred_work_after %d, "
++            "current_target_before %.6f, current_target_after %.6f, "
++            "deferred_target_before %.6f, deferred_target_after %.6f.\n",
++            iface, session, wine_dbgstr_longlong(source_generation), time, hr, flags_before,
++            flags_after, !!(flags_after & FLAGS_ENGINE_SEEKING),
++            !!(flags_after & FLAGS_ENGINE_DEFERRED_SEEK), deferred_work_before,
++            deferred_work_after, current_target_before, current_target_after,
++            deferred_target_before, deferred_target_after);
++
+     return hr;
+ }
+ 
+@@ -2709,13 +2783,23 @@ static double WINAPI media_engine_GetDuration(IMFMediaEngineEx *iface)
+ static BOOL WINAPI media_engine_IsPaused(IMFMediaEngineEx *iface)
+ {
+     struct media_engine *engine = impl_from_IMFMediaEngineEx(iface);
++    IMFMediaSession *session;
++    UINT64 source_generation;
++    unsigned int flags;
+     BOOL value;
+ 
+     EnterCriticalSection(&engine->cs);
+     value = !!(engine->flags & FLAGS_ENGINE_PAUSED);
+     TRACE("%p returning %d flags %#x.\n", iface, value, engine->flags);
++    source_generation = engine->source_generation;
++    session = engine->session;
++    flags = engine->flags;
+     LeaveCriticalSection(&engine->cs);
+ 
++    TRACE_(avprostate)("engine %p, session %p, source_gen %s, call IsPaused, "
++            "return %d, flags %#x.\n", iface, session,
++            wine_dbgstr_longlong(source_generation), value, flags);
++
+     return value;
+ }
+ 
+@@ -4192,6 +4276,12 @@ static HRESULT WINAPI media_engine_SetRealTimeMode(IMFMediaEngineEx *iface, BOOL
+ static HRESULT WINAPI media_engine_SetCurrentTimeEx(IMFMediaEngineEx *iface, double seektime, MF_MEDIA_ENGINE_SEEK_MODE mode)
+ {
+     struct media_engine *engine = impl_from_IMFMediaEngineEx(iface);
++    double current_target_before, current_target_after;
++    double deferred_target_before, deferred_target_after;
++    BOOL deferred_work_before, deferred_work_after;
++    IMFMediaSession *session;
++    UINT64 source_generation;
++    unsigned int flags_before, flags_after;
+     HRESULT hr;
+ 
+     TRACE("%p, %f, %#x.\n", iface, seektime, mode);
+@@ -4200,14 +4290,36 @@ static HRESULT WINAPI media_engine_SetCurrentTimeEx(IMFMediaEngineEx *iface, dou
+         FIXME("mode %#x is ignored.\n", mode);
+ 
+     EnterCriticalSection(&engine->cs);
++    flags_before = engine->flags;
++    current_target_before = engine->current_seek;
++    deferred_target_before = engine->deferred_seek;
++    deferred_work_before = engine->deferred_seek_work_scheduled;
+ 
+     if (engine->flags & FLAGS_ENGINE_SHUT_DOWN)
+         hr = MF_E_SHUTDOWN;
+     else
+         hr = media_engine_defer_current_time(engine, seektime);
+ 
++    source_generation = engine->source_generation;
++    session = engine->session;
++    flags_after = engine->flags;
++    current_target_after = engine->current_seek;
++    deferred_target_after = engine->deferred_seek;
++    deferred_work_after = engine->deferred_seek_work_scheduled;
+     LeaveCriticalSection(&engine->cs);
+ 
++    TRACE_(avprostate)("engine %p, session %p, source_gen %s, call SetCurrentTimeEx, "
++            "target %.6f, mode %#x, hr %#lx, "
++            "flags_before %#x, flags_after %#x, real_after %d, deferred_after %d, "
++            "deferred_work_before %d, deferred_work_after %d, "
++            "current_target_before %.6f, current_target_after %.6f, "
++            "deferred_target_before %.6f, deferred_target_after %.6f.\n",
++            iface, session, wine_dbgstr_longlong(source_generation), seektime, mode, hr,
++            flags_before, flags_after, !!(flags_after & FLAGS_ENGINE_SEEKING),
++            !!(flags_after & FLAGS_ENGINE_DEFERRED_SEEK), deferred_work_before,
++            deferred_work_after, current_target_before, current_target_after,
++            deferred_target_before, deferred_target_after);
++
+     return hr;
+ }
+ 

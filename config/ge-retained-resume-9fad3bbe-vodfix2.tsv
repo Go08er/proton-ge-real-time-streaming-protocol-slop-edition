@@ -1,0 +1,31 @@
+retained_resume_manifest_version	1
+source_commit	9fad3bbe270409e67a8d2f4d123afc73d848306a
+generated_makefile	Makefile	779	6c8347fea632d92a808b6e9c2320e2e1d0f66c6a3629f3808b4fa7825ea63d66
+host_shell_makefile	.host-shell.mk	150	c7f8f102072bb8c152f9030fa0c34dd3e1bab98bd6b293a3315038de3f590905
+file	obj-wine-x86_64/config.status	118725	827bcbadadb43459bfb849136a8eea359bd2eaa743ddfe24e1744f2d8c4f2b08
+file	obj-wine-i386/config.status	113381	d3a0e7c75a6430875d3d10897628c2c247090e0ef91fd4f5218c683a5bff5882
+file	obj-ffmpeg-x86_64/ffbuild/config.mak	89749	067050015b5af6edaf07629201f83c05efa500674c3e6a4dee92d91c243c0653
+file	obj-dxvk-x86_64/build.ninja	474701	7cd741803d258e8710be4c3f2cfbd38e5455bf9945a1af0f7cb0a31f7b25c99d
+file	obj-kaldi-x86_64/CMakeCache.txt	27170	48265f72d3fca21aa289b7056ea00b68e7bff124d6d5d13b872f893b2b2b3b5a
+file	obj-wine-i386/dlls/mfmediaengine/i386-windows/video_frame_sink.o	216410	f70d81ae93901ac5df67a4ed0e0392c22c644c5f49d50b401cbfb63b2c10f8ae
+file	obj-wine-x86_64/dlls/mfmediaengine/x86_64-windows/video_frame_sink.o	258044	3f8ba2ad0155ee12cac43cec834a2e1c9c2805d994fb5edd8cf7bc8ad4bfa86e
+present	.ffmpeg-i386-dist
+present	.ffmpeg-x86_64-dist
+present	.kaldi-i386-dist
+present	.kaldi-x86_64-dist
+present	.vosk-i386-dist
+present	.vosk-x86_64-dist
+present	.xz-i386-dist
+present	.xz-x86_64-dist
+present	.wine-source
+present	.wine-post-source
+present	.wine-i386-configure
+present	.wine-x86_64-configure
+present	.wine-i386-tools
+present	.wine-x86_64-tools
+absent	.wine-i386-build
+absent	.wine-x86_64-build
+absent	.wine-i386-dist
+absent	.wine-x86_64-dist
+absent	obj-wine-i386/dlls/mfmediaengine/i386-windows/main.o
+absent	obj-wine-x86_64/dlls/mfmediaengine/x86_64-windows/main.o

@@ -1,0 +1,656 @@
+From 62ea64fa617b4f6b94e5b75998750db84070cbce Mon Sep 17 00:00:00 2001
+From: RTSP-on-GE design <rtsp-on-ge@example.invalid>
+Date: Tue, 28 Jul 2026 14:58:00 -0500
+Subject: [PATCH] winedmo,mf: trace bounded RTSP drain state
+
+The in-game RTSP failure reaches a terminal reader timeout, but broad Media
+Foundation tracing is too large for a headset session and the existing
+contained driver does not consume video frames like AVPro. Add an opt-in,
+process-bounded diagnostic channel at the compressed-packet boundary.
+
+Record only fixed labels, process-local source and stream identifiers, queue
+counts and high-water marks, sample-demand counters, completed packet bytes,
+read duration, and numeric status. Preserve the queue predicate and all
+timeouts. Direct RTSP transport-byte progress remains below FFmpeg's public
+AVFormat interface, so omit that field rather than mislabeling completed
+AVPacket bytes.
+
+Keep normal runs effectively unchanged: route detection and all bookkeeping
+are inactive unless the dedicated rtspdrain channel is selected. Instrument
+at most 64 RTSP sources per process, with 16 live records per source and
+unconditional bounded final summaries, so an early source cannot consume the
+evidence allowance for a later successful start.
+
+Also summarize the first 64 streaming audio renderers. Count presentation
+clock starts, the underlying audio-client start result, samples received
+before the first clock-start callback, render callbacks, and queued-frame
+high-water state. This distinguishes a missing clock start from audio demand
+which stops after a successful start without enabling broad mfplat tracing.
+The SAR/source association is deliberately temporal and by process-local
+creation order; no media identifier crosses the layer boundary.
+---
+ dlls/mf/sar.c                |  77 ++++++++++++
+ dlls/winedmo/media_source.c  | 292 +++++++++++++++++++++++++++++++++++++++++++-
+ 2 files changed, 361 insertions(+), 8 deletions(-)
+
+diff --git a/dlls/winedmo/media_source.c b/dlls/winedmo/media_source.c
+--- a/dlls/winedmo/media_source.c
++++ b/dlls/winedmo/media_source.c
+@@ -31,6 +31,9 @@
+ #include "wine/list.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(mfplat);
++WINE_DECLARE_DEBUG_CHANNEL(rtspdrain);
++
++static LONG rtspdrain_next_source_id;
+ 
+ /* ========================================================================
+  * object_context — carries state through async BeginCreateObject
+@@ -251,6 +254,11 @@
+ #define MEDIA_SOURCE_MAX_QUEUED_BYTES   (8 * 1024 * 1024)
+ #define MEDIA_SOURCE_EMERGENCY_QUEUED_PACKETS 1024
+ #define MEDIA_SOURCE_EMERGENCY_QUEUED_BYTES   (64 * 1024 * 1024)
++#define MEDIA_SOURCE_DRAIN_DIAG_SOURCE_LIMIT 64
++#define MEDIA_SOURCE_DRAIN_DIAG_LIVE_RECORDS 16
++#define MEDIA_SOURCE_DRAIN_DIAG_STREAM_RECORDS 8
++#define MEDIA_SOURCE_DRAIN_DIAG_PROGRESS_MS 10000
++#define MEDIA_SOURCE_DRAIN_DIAG_QUEUE_WAIT_MS 5000
+ 
+ struct media_stream;
+ 
+@@ -289,6 +297,12 @@
+     LONG request_generation;
+     UINT queued_packets;
+     UINT64 queued_bytes;
++    UINT drain_diag_high_packets;
++    UINT64 drain_diag_high_bytes;
++    LONG drain_diag_enqueued;
++    LONG drain_diag_requests;
++    LONG drain_diag_dequeued;
++    LONG drain_diag_delivered;
+ };
+ 
+ static void media_packet_queue_flush(struct media_stream *stream)
+@@ -383,6 +397,24 @@
+     struct media_stream **streams;
+     ULONG stream_count;
+ 
++    BOOL drain_diag_enabled;
++    BOOL drain_diag_forced_tcp;
++    ULONG drain_diag_id;
++    LONG drain_diag_live_records;
++    LONG drain_diag_live_exhausted;
++    UINT drain_diag_queue_reason;
++    UINT64 drain_diag_queued_packets;
++    UINT64 drain_diag_queued_bytes;
++    UINT64 drain_diag_high_packets;
++    UINT64 drain_diag_high_bytes;
++    UINT64 drain_diag_read_calls;
++    UINT64 drain_diag_completed_packets;
++    UINT64 drain_diag_completed_bytes;
++    ULONGLONG drain_diag_last_queue_report_ms;
++    ULONGLONG drain_diag_last_progress_ms;
++    ULONGLONG drain_diag_last_completed_ms;
++    ULONGLONG drain_diag_max_read_ms;
++
+     enum
+     {
+         SOURCE_OPENING,
+@@ -498,19 +530,172 @@
+ 
+ static HRESULT media_stream_send_eos(struct media_source *source, struct media_stream *stream);
+ 
++enum drain_diag_queue_reason
++{
++    DRAIN_DIAG_QUEUE_IDLE = 0x01,
++    DRAIN_DIAG_QUEUE_STREAM_PACKETS = 0x02,
++    DRAIN_DIAG_QUEUE_STREAM_BYTES = 0x04,
++    DRAIN_DIAG_QUEUE_EMERGENCY_PACKETS = 0x08,
++    DRAIN_DIAG_QUEUE_EMERGENCY_BYTES = 0x10,
++};
++
++static BOOL media_source_drain_diag_live_record(struct media_source *source)
++{
++    LONG records;
++
++    if (!source->drain_diag_enabled || source->drain_diag_live_exhausted)
++        return FALSE;
++    records = ++source->drain_diag_live_records;
++    if (records == MEDIA_SOURCE_DRAIN_DIAG_LIVE_RECORDS)
++        source->drain_diag_live_exhausted = TRUE;
++    return TRUE;
++}
++
++static void media_source_drain_diag_queue(struct media_source *source, UINT reason,
++        UINT64 queued_packets, UINT64 queued_bytes)
++{
++    ULONGLONG now;
++    const char *event = NULL;
++
++    if (!source->drain_diag_enabled)
++        return;
++    now = GetTickCount64();
++
++    source->drain_diag_queued_packets = queued_packets;
++    source->drain_diag_queued_bytes = queued_bytes;
++    if (queued_packets > source->drain_diag_high_packets)
++        source->drain_diag_high_packets = queued_packets;
++    if (queued_bytes > source->drain_diag_high_bytes)
++        source->drain_diag_high_bytes = queued_bytes;
++
++    if (source->drain_diag_live_exhausted)
++    {
++        source->drain_diag_queue_reason = reason;
++        return;
++    }
++
++    if (reason != source->drain_diag_queue_reason)
++        event = !reason ? "queue_leave" :
++                !source->drain_diag_queue_reason ? "queue_enter" : "queue_change";
++    else if (reason && now - source->drain_diag_last_queue_report_ms
++            >= MEDIA_SOURCE_DRAIN_DIAG_QUEUE_WAIT_MS)
++        event = "queue_wait";
++    else if (!reason && now - source->drain_diag_last_progress_ms
++            >= MEDIA_SOURCE_DRAIN_DIAG_PROGRESS_MS)
++        event = "progress";
++
++    if (event)
++    {
++        if (reason)
++            source->drain_diag_last_queue_report_ms = now;
++        else
++            source->drain_diag_last_progress_ms = now;
++        if (media_source_drain_diag_live_record(source))
++            TRACE_(rtspdrain)("event=%s source_id=%lu forced_tcp=%u queued_packets=%I64u "
++                    "queued_bytes=%I64u high_packets=%I64u high_bytes=%I64u "
++                    "idle=%u normal_packets=%u normal_bytes=%u emergency_packets=%u "
++                    "emergency_bytes=%u read_calls=%I64u completed_packets=%I64u "
++                    "packet_bytes_completed=%I64u\n", event, source->drain_diag_id,
++                    source->drain_diag_forced_tcp,
++                    queued_packets, queued_bytes, source->drain_diag_high_packets,
++                    source->drain_diag_high_bytes, !!(reason & DRAIN_DIAG_QUEUE_IDLE),
++                    !!(reason & DRAIN_DIAG_QUEUE_STREAM_PACKETS),
++                    !!(reason & DRAIN_DIAG_QUEUE_STREAM_BYTES),
++                    !!(reason & DRAIN_DIAG_QUEUE_EMERGENCY_PACKETS),
++                    !!(reason & DRAIN_DIAG_QUEUE_EMERGENCY_BYTES),
++                    source->drain_diag_read_calls, source->drain_diag_completed_packets,
++                    source->drain_diag_completed_bytes);
++    }
++    source->drain_diag_queue_reason = reason;
++}
++
++static void media_source_drain_diag_read_result(struct media_source *source,
++        NTSTATUS status, ULONGLONG elapsed_ms, BOOL terminal)
++{
++    ULONGLONG last_packet_age_ms;
++
++    if (!source->drain_diag_enabled || (!terminal && elapsed_ms < 1000))
++        return;
++    if (!terminal && !media_source_drain_diag_live_record(source))
++        return;
++
++    last_packet_age_ms = source->drain_diag_last_completed_ms
++            ? GetTickCount64() - source->drain_diag_last_completed_ms : 0;
++    TRACE_(rtspdrain)("event=read_result source_id=%lu forced_tcp=%u status=%#lx "
++            "elapsed_ms=%I64u read_calls=%I64u completed_packets=%I64u "
++            "packet_bytes_completed=%I64u packet_seen=%u last_packet_age_ms=%I64u "
++            "queued_packets=%I64u queued_bytes=%I64u idle=%u normal_packets=%u "
++            "normal_bytes=%u emergency_packets=%u emergency_bytes=%u\n",
++            source->drain_diag_id,
++            source->drain_diag_forced_tcp, status, elapsed_ms,
++            source->drain_diag_read_calls, source->drain_diag_completed_packets,
++            source->drain_diag_completed_bytes, !!source->drain_diag_last_completed_ms,
++            last_packet_age_ms, source->drain_diag_queued_packets,
++            source->drain_diag_queued_bytes,
++            !!(source->drain_diag_queue_reason & DRAIN_DIAG_QUEUE_IDLE),
++            !!(source->drain_diag_queue_reason & DRAIN_DIAG_QUEUE_STREAM_PACKETS),
++            !!(source->drain_diag_queue_reason & DRAIN_DIAG_QUEUE_STREAM_BYTES),
++            !!(source->drain_diag_queue_reason & DRAIN_DIAG_QUEUE_EMERGENCY_PACKETS),
++            !!(source->drain_diag_queue_reason & DRAIN_DIAG_QUEUE_EMERGENCY_BYTES));
++}
++
++static void media_source_drain_diag_summary(struct media_source *source)
++{
++    UINT i;
++
++    if (!source->drain_diag_enabled)
++        return;
++
++    for (i = 0; i < source->stream_count
++            && i < MEDIA_SOURCE_DRAIN_DIAG_STREAM_RECORDS; ++i)
++    {
++        struct media_stream *stream = source->streams[i];
++        UINT high_packets;
++        UINT64 high_bytes;
++        LONG enqueued, requests, dequeued, delivered;
++
++        EnterCriticalSection(&stream->queue_cs);
++        high_packets = stream->drain_diag_high_packets;
++        high_bytes = stream->drain_diag_high_bytes;
++        enqueued = InterlockedCompareExchange(&stream->drain_diag_enqueued, 0, 0);
++        requests = InterlockedCompareExchange(&stream->drain_diag_requests, 0, 0);
++        dequeued = InterlockedCompareExchange(&stream->drain_diag_dequeued, 0, 0);
++        delivered = InterlockedCompareExchange(&stream->drain_diag_delivered, 0, 0);
++        LeaveCriticalSection(&stream->queue_cs);
++        TRACE_(rtspdrain)("event=stream_summary source_id=%lu stream=%u video=%u "
++                "high_packets=%u high_bytes=%I64u enqueued=%ld requests=%ld "
++                "dequeued=%ld delivered=%ld\n", source->drain_diag_id,
++                stream->stream_index, stream->is_video, high_packets, high_bytes,
++                enqueued, requests, dequeued, delivered);
++    }
++
++    TRACE_(rtspdrain)("event=source_summary source_id=%lu forced_tcp=%u streams=%lu "
++            "stream_record_limit=%u high_packets=%I64u high_bytes=%I64u "
++            "read_calls=%I64u completed_packets=%I64u packet_bytes_completed=%I64u "
++            "max_read_ms=%I64u live_records=%ld live_exhausted=%ld\n",
++            source->drain_diag_id, source->drain_diag_forced_tcp, source->stream_count,
++            MEDIA_SOURCE_DRAIN_DIAG_STREAM_RECORDS, source->drain_diag_high_packets,
++            source->drain_diag_high_bytes, source->drain_diag_read_calls,
++            source->drain_diag_completed_packets, source->drain_diag_completed_bytes,
++            source->drain_diag_max_read_ms,
++            source->drain_diag_live_records, source->drain_diag_live_exhausted);
++}
++
+ static BOOL media_source_stream_queues_full(struct media_source *source)
+ {
+     UINT i;
+     BOOL any_active = FALSE;
+     BOOL primed = TRUE;
+-    BOOL any_full = FALSE;
++    BOOL any_packet_full = FALSE;
++    BOOL any_byte_full = FALSE;
++    BOOL drain_diag = source->drain_diag_enabled;
+     UINT64 queued_packets = 0;
+     UINT64 queued_bytes = 0;
++    UINT reason = 0;
+ 
+     for (i = 0; i < source->stream_count; ++i)
+     {
+         struct media_stream *stream = source->streams[i];
+-        BOOL full;
+         BOOL empty;
+ 
+         EnterCriticalSection(&stream->queue_cs);
+@@ -521,20 +706,38 @@
+         }
+         any_active = TRUE;
+         empty = !stream->queued_packets;
+-        full = stream->queued_packets >= MEDIA_SOURCE_MAX_QUEUED_PACKETS
+-                || stream->queued_bytes >= MEDIA_SOURCE_MAX_QUEUED_BYTES;
++        if (drain_diag)
++        {
++            if (stream->queued_packets > stream->drain_diag_high_packets)
++                stream->drain_diag_high_packets = stream->queued_packets;
++            if (stream->queued_bytes > stream->drain_diag_high_bytes)
++                stream->drain_diag_high_bytes = stream->queued_bytes;
++        }
++        if (stream->queued_packets >= MEDIA_SOURCE_MAX_QUEUED_PACKETS)
++            any_packet_full = TRUE;
++        if (stream->queued_bytes >= MEDIA_SOURCE_MAX_QUEUED_BYTES)
++            any_byte_full = TRUE;
+         queued_packets += stream->queued_packets;
+         queued_bytes += stream->queued_bytes;
+         LeaveCriticalSection(&stream->queue_cs);
+ 
+         if (empty)
+             primed = FALSE;
+-        if (full)
+-            any_full = TRUE;
+     }
+ 
+-    return !any_active || queued_packets >= MEDIA_SOURCE_EMERGENCY_QUEUED_PACKETS
+-            || queued_bytes >= MEDIA_SOURCE_EMERGENCY_QUEUED_BYTES || (primed && any_full);
++    if (!any_active)
++        reason |= DRAIN_DIAG_QUEUE_IDLE;
++    if (queued_packets >= MEDIA_SOURCE_EMERGENCY_QUEUED_PACKETS)
++        reason |= DRAIN_DIAG_QUEUE_EMERGENCY_PACKETS;
++    if (queued_bytes >= MEDIA_SOURCE_EMERGENCY_QUEUED_BYTES)
++        reason |= DRAIN_DIAG_QUEUE_EMERGENCY_BYTES;
++    if (primed && any_packet_full)
++        reason |= DRAIN_DIAG_QUEUE_STREAM_PACKETS;
++    if (primed && any_byte_full)
++        reason |= DRAIN_DIAG_QUEUE_STREAM_BYTES;
++    if (drain_diag)
++        media_source_drain_diag_queue(source, reason, queued_packets, queued_bytes);
++    return !!reason;
+ }
+ 
+ /* ========================================================================
+@@ -1427,6 +1630,8 @@
+         list_remove(&pkt->entry);
+         --stream->queued_packets;
+         stream->queued_bytes -= pkt->size;
++        if (source->drain_diag_enabled)
++            InterlockedIncrement(&stream->drain_diag_dequeued);
+     }
+     LeaveCriticalSection(&stream->queue_cs);
+     return pkt;
+@@ -1434,10 +1639,19 @@
+ 
+ static void stream_requeue_packet(struct media_stream *stream, struct media_packet *pkt)
+ {
++    struct media_source *source = impl_from_IMFMediaSource(stream->media_source);
++
+     EnterCriticalSection(&stream->queue_cs);
+     list_add_head(&stream->packet_queue, &pkt->entry);
+     ++stream->queued_packets;
+     stream->queued_bytes += pkt->size;
++    if (source->drain_diag_enabled)
++    {
++        if (stream->queued_packets > stream->drain_diag_high_packets)
++            stream->drain_diag_high_packets = stream->queued_packets;
++        if (stream->queued_bytes > stream->drain_diag_high_bytes)
++            stream->drain_diag_high_bytes = stream->queued_bytes;
++    }
+     WakeConditionVariable(&stream->queue_cv);
+     LeaveCriticalSection(&stream->queue_cs);
+ }
+@@ -1507,6 +1721,8 @@
+         if (pkt)
+         {
+             hr = media_stream_send_sample(stream, pkt, *token);
++            if (SUCCEEDED(hr) && source->drain_diag_enabled)
++                InterlockedIncrement(&stream->drain_diag_delivered);
+             media_packet_free(pkt);
+             return hr;
+         }
+@@ -1561,8 +1777,25 @@
+ {
+     struct media_source *source = arg;
+     ULONG buffer_size = 0x40000;
++    BOOL drain_diag = source->drain_diag_enabled;
+ 
+     TRACE("Demux thread starting for source %p.\n", source);
++    if (drain_diag)
++    {
++        source->drain_diag_last_progress_ms = GetTickCount64();
++        source->drain_diag_last_queue_report_ms = source->drain_diag_last_progress_ms;
++    }
++    if (media_source_drain_diag_live_record(source))
++        TRACE_(rtspdrain)("event=source_start source_id=%lu forced_tcp=%u streams=%lu "
++                "normal_packets=%u normal_bytes=%u emergency_packets=%u "
++                "emergency_bytes=%u source_limit=%u live_record_limit=%u\n",
++                source->drain_diag_id, source->drain_diag_forced_tcp,
++                source->stream_count,
++                MEDIA_SOURCE_MAX_QUEUED_PACKETS, MEDIA_SOURCE_MAX_QUEUED_BYTES,
++                MEDIA_SOURCE_EMERGENCY_QUEUED_PACKETS,
++                MEDIA_SOURCE_EMERGENCY_QUEUED_BYTES,
++                MEDIA_SOURCE_DRAIN_DIAG_SOURCE_LIMIT,
++                MEDIA_SOURCE_DRAIN_DIAG_LIVE_RECORDS);
+ 
+     while (!source->demux_thread_shutdown)
+     {
+@@ -1575,6 +1808,7 @@
+         LONG read_epoch;
+         BYTE *src_data;
+         DWORD data_len;
++        ULONGLONG read_start, read_elapsed;
+ 
+         if (source->flushing)
+         {
+@@ -1612,7 +1846,18 @@
+             Sleep(1);
+             continue;
+         }
++        if (drain_diag)
++        {
++            read_start = GetTickCount64();
++            ++source->drain_diag_read_calls;
++        }
+         status = winedmo_demuxer_read(source->demuxer, &stream_idx, &output, &needed_size);
++        if (drain_diag)
++        {
++            read_elapsed = GetTickCount64() - read_start;
++            if (read_elapsed > source->drain_diag_max_read_ms)
++                source->drain_diag_max_read_ms = read_elapsed;
++        }
+ 
+         /* Claim a terminal network error while this lock still excludes a
+          * seek. A seek which began before this claim changes the transition
+@@ -1632,10 +1877,14 @@
+ 
+             media_source_queue_demux_error(source, error);
+             LeaveCriticalSection(&source->demuxer_cs);
++            if (drain_diag)
++                media_source_drain_diag_read_result(source, status, read_elapsed, TRUE);
+             IMediaBuffer_Release(&sbuf->IMediaBuffer_iface);
+             break;
+         }
+         LeaveCriticalSection(&source->demuxer_cs);
++        if (drain_diag)
++            media_source_drain_diag_read_result(source, status, read_elapsed, FALSE);
+ 
+         if (status == STATUS_BUFFER_TOO_SMALL)
+         {
+@@ -1696,6 +1945,12 @@
+             continue;
+         }
+ 
++        if (drain_diag)
++        {
++            ++source->drain_diag_completed_packets;
++            source->drain_diag_completed_bytes += data_len;
++            source->drain_diag_last_completed_ms = GetTickCount64();
++        }
+         if ((pkt = malloc(sizeof(*pkt))) && (pkt->data = malloc(data_len)))
+         {
+             BOOL queued = FALSE;
+@@ -1718,6 +1973,14 @@
+                 list_add_tail(&stream->packet_queue, &pkt->entry);
+                 ++stream->queued_packets;
+                 stream->queued_bytes += pkt->size;
++                if (drain_diag)
++                {
++                    if (stream->queued_packets > stream->drain_diag_high_packets)
++                        stream->drain_diag_high_packets = stream->queued_packets;
++                    if (stream->queued_bytes > stream->drain_diag_high_bytes)
++                        stream->drain_diag_high_bytes = stream->queued_bytes;
++                    InterlockedIncrement(&stream->drain_diag_enqueued);
++                }
+                 queued = TRUE;
+             }
+             LeaveCriticalSection(&stream->queue_cs);
+@@ -1741,6 +2004,7 @@
+         IMediaBuffer_Release(&sbuf->IMediaBuffer_iface);
+     }
+ 
++    media_source_drain_diag_summary(source);
+     TRACE("Demux thread stopping for source %p.\n", source);
+     return 0;
+ }
+@@ -2018,6 +2282,8 @@
+             hr = S_OK;
+     }
+ 
++    if (SUCCEEDED(hr) && source->drain_diag_enabled)
++        InterlockedIncrement(&stream->drain_diag_requests);
+     LeaveCriticalSection(&source->cs);
+ 
+     return hr;
+@@ -2728,6 +2994,16 @@
+     if (!(object = calloc(1, sizeof(*object))))
+         return E_OUTOFMEMORY;
+ 
++    if (TRACE_ON(rtspdrain) && context->url
++            && (!wcsnicmp(context->url, L"rtsp://", 7)
++            || !wcsnicmp(context->url, L"rtspt://", 8)))
++    {
++        object->drain_diag_forced_tcp = !wcsnicmp(context->url, L"rtspt://", 8);
++        object->drain_diag_id = InterlockedIncrement(&rtspdrain_next_source_id);
++        object->drain_diag_enabled =
++                object->drain_diag_id <= MEDIA_SOURCE_DRAIN_DIAG_SOURCE_LIMIT;
++    }
++
+     object->IMFMediaSource_iface.lpVtbl = &IMFMediaSource_vtbl;
+     object->IMFGetService_iface.lpVtbl = &media_source_get_service_vtbl;
+     object->IMFRateSupport_iface.lpVtbl = &media_source_rate_support_vtbl;
+diff --git a/dlls/mf/sar.c b/dlls/mf/sar.c
+--- a/dlls/mf/sar.c
++++ b/dlls/mf/sar.c
+@@ -29,6 +29,11 @@
+ #include "wine/list.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(mfplat);
++WINE_DECLARE_DEBUG_CHANNEL(rtspdrain);
++
++#define SAR_DRAIN_DIAG_SINK_LIMIT 64
++
++static LONG rtspdrain_next_sar_id;
+ 
+ enum audio_renderer_flags
+ {
+@@ -113,6 +118,19 @@ struct audio_renderer
+     UINT64 position;
+     UINT64 audio_clock_frequency;
+     float rate;
++
++    BOOL drain_diag_enabled;
++    BOOL drain_diag_summary_emitted;
++    ULONG drain_diag_id;
++    ULONGLONG drain_diag_created_ms;
++    UINT64 drain_diag_clock_start_calls;
++    UINT64 drain_diag_clock_start_successes;
++    UINT64 drain_diag_audio_client_start_calls;
++    UINT64 drain_diag_audio_client_start_successes;
++    UINT64 drain_diag_process_samples;
++    UINT64 drain_diag_preclock_samples;
++    UINT64 drain_diag_render_callbacks;
++    unsigned int drain_diag_peak_queued_frames;
+ };
+ 
+ static void release_pending_object(struct queued_object *object)
+@@ -277,6 +295,31 @@ static void audio_renderer_release_audio_client(struct audio_renderer *renderer)
+     renderer->flags &= ~SAR_PREROLLED;
+ }
+ 
++static void audio_renderer_drain_diag_summary(struct audio_renderer *renderer)
++{
++    if (!renderer->drain_diag_enabled || renderer->drain_diag_summary_emitted)
++        return;
++
++    renderer->drain_diag_summary_emitted = TRUE;
++    TRACE_(rtspdrain)("event=sar_summary sar_id=%lu lifetime_ms=%I64u "
++            "clock_start_calls=%I64u clock_start_successes=%I64u "
++            "audio_client_start_calls=%I64u audio_client_start_successes=%I64u "
++            "process_samples=%I64u preclock_samples=%I64u render_callbacks=%I64u "
++            "queued_frames=%u peak_queued_frames=%u max_frames=%u sample_rate=%lu "
++            "frame_size=%u clock_state=%u start_pending=%u\n", renderer->drain_diag_id,
++            GetTickCount64() - renderer->drain_diag_created_ms,
++            renderer->drain_diag_clock_start_calls,
++            renderer->drain_diag_clock_start_successes,
++            renderer->drain_diag_audio_client_start_calls,
++            renderer->drain_diag_audio_client_start_successes,
++            renderer->drain_diag_process_samples,
++            renderer->drain_diag_preclock_samples,
++            renderer->drain_diag_render_callbacks, renderer->queued_frames,
++            renderer->drain_diag_peak_queued_frames, renderer->max_frames, renderer->sample_rate,
++            renderer->frame_size, (unsigned int)renderer->clock_state,
++            !!(renderer->flags & SAR_AUDIO_START_PENDING));
++}
++
+ static ULONG WINAPI audio_renderer_sink_Release(IMFMediaSink *iface)
+ {
+     struct audio_renderer *renderer = impl_from_IMFMediaSink(iface);
+@@ -286,6 +329,7 @@ static ULONG WINAPI audio_renderer_sink_Release(IMFMediaSink *iface)
+ 
+     if (!refcount)
+     {
++        audio_renderer_drain_diag_summary(renderer);
+         if (renderer->event_queue)
+             IMFMediaEventQueue_Release(renderer->event_queue);
+         if (renderer->stream_event_queue)
+@@ -487,6 +531,7 @@ static HRESULT WINAPI audio_renderer_sink_Shutdown(IMFMediaSink *iface)
+     else
+     {
+         renderer->flags |= SAR_SHUT_DOWN;
++        audio_renderer_drain_diag_summary(renderer);
+         IMFMediaEventQueue_Shutdown(renderer->event_queue);
+         IMFMediaEventQueue_Shutdown(renderer->stream_event_queue);
+         audio_renderer_set_presentation_clock(renderer, NULL);
+@@ -639,10 +684,16 @@ static HRESULT audio_renderer_start_audio_client(struct audio_renderer *renderer
+ 
+     if (renderer->rate != 0.0f)
+     {
++        if (renderer->drain_diag_enabled)
++            ++renderer->drain_diag_audio_client_start_calls;
+         if (FAILED(hr = IAudioClient_Start(renderer->audio_client)))
+             renderer->flags |= SAR_AUDIO_START_PENDING;
+         else
++        {
+             renderer->flags &= ~SAR_AUDIO_START_PENDING;
++            if (renderer->drain_diag_enabled)
++                ++renderer->drain_diag_audio_client_start_successes;
++        }
+     }
+     else
+         renderer->flags &= ~SAR_AUDIO_START_PENDING;
+@@ -676,6 +727,8 @@ static HRESULT WINAPI audio_renderer_clock_sink_OnClockStart(IMFClockStateSink *
+     TRACE("%p, %s, %s.\n", iface, debugstr_time(systime), debugstr_time(offset));
+ 
+     EnterCriticalSection(&renderer->cs);
++    if (renderer->drain_diag_enabled)
++        ++renderer->drain_diag_clock_start_calls;
+     if (renderer->audio_client)
+     {
+         if (offset != PRESENTATION_CURRENT_POSITION)
+@@ -698,7 +751,11 @@ static HRESULT WINAPI audio_renderer_clock_sink_OnClockStart(IMFClockStateSink *
+     if (renderer->rate == 0.0f)
+         IMFMediaEventQueue_QueueEventParamVar(renderer->stream_event_queue, MEStreamSinkScrubSampleComplete, &GUID_NULL, hr, NULL);
+     if (SUCCEEDED(hr))
++    {
++        if (renderer->drain_diag_enabled)
++            ++renderer->drain_diag_clock_start_successes;
+         audio_renderer_preroll(renderer);
++    }
+     LeaveCriticalSection(&renderer->cs);
+ 
+     return hr;
+@@ -1589,6 +1646,9 @@ static HRESULT stream_queue_sample(struct audio_renderer *renderer, IMFSample *s
+ 
+     list_add_tail(&renderer->queue, &object->entry);
+     renderer->queued_frames += sample_frames;
++    if (renderer->drain_diag_enabled
++            && renderer->queued_frames > renderer->drain_diag_peak_queued_frames)
++        renderer->drain_diag_peak_queued_frames = renderer->queued_frames;
+ 
+     return S_OK;
+ }
+@@ -1609,6 +1669,12 @@ static HRESULT WINAPI audio_renderer_stream_ProcessSample(IMFStreamSink *iface,
+         hr = MF_E_STREAMSINK_REMOVED;
+     else
+     {
++        if (renderer->drain_diag_enabled)
++        {
++            ++renderer->drain_diag_process_samples;
++            if (!renderer->drain_diag_clock_start_calls)
++                ++renderer->drain_diag_preclock_samples;
++        }
+         if (renderer->clock_state == MFCLOCK_STATE_RUNNING)
+             hr = stream_queue_sample(renderer, sample);
+         renderer->flags &= ~SAR_SAMPLE_REQUESTED;
+@@ -2216,7 +2282,11 @@ static HRESULT WINAPI audio_renderer_render_callback_Invoke(IMFAsyncCallback *if
+ 
+     EnterCriticalSection(&renderer->cs);
+     if (!(renderer->flags & SAR_SHUT_DOWN))
++    {
++        if (renderer->drain_diag_enabled)
++            ++renderer->drain_diag_render_callbacks;
+         audio_renderer_render(renderer, result);
++    }
+     LeaveCriticalSection(&renderer->cs);
+ 
+     return S_OK;
+@@ -2241,6 +2311,13 @@ static HRESULT sar_create_object(IMFAttributes *attributes, void *user_context,
+     if (!(renderer = calloc(1, sizeof(*renderer))))
+         return E_OUTOFMEMORY;
+ 
++    if (TRACE_ON(rtspdrain))
++    {
++        renderer->drain_diag_id = InterlockedIncrement(&rtspdrain_next_sar_id);
++        renderer->drain_diag_enabled = renderer->drain_diag_id <= SAR_DRAIN_DIAG_SINK_LIMIT;
++        renderer->drain_diag_created_ms = GetTickCount64();
++    }
++
+     renderer->IMFMediaSink_iface.lpVtbl = &audio_renderer_sink_vtbl;
+     renderer->IMFMediaSinkPreroll_iface.lpVtbl = &audio_renderer_preroll_vtbl;
+     renderer->IMFStreamSink_iface.lpVtbl = &audio_renderer_stream_vtbl;

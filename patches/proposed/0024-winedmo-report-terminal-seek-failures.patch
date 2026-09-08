@@ -1,0 +1,99 @@
+From: RTSP-on-GE11 contributors <noreply@invalid>
+Subject: [PROPOSED] winedmo: report irreversible seek failures to MediaEngine
+
+Review overlay against the final A3.19 Wine tree. Fold into a fresh candidate's
+terminal-error patch after review; no historical pin or artifact is changed.
+
+A non-progressive avformat_seek_file() failure returns STATUS_UNSUCCESSFUL.
+After the old timeline has been flushed, media_source_start() stops the demux
+thread and retains that failure, but MediaSession and MediaEngine recognize
+only cancellation and network errors. The source's generic MEError is lost,
+leaving the pending session start and engine seek unresolved.
+
+Normalize only this irreversible post-flush seek failure to
+MF_E_INVALID_POSITION, retaining the original numeric error in a warning.
+Publish it through the existing first-error-wins helper and admit that one
+additional status through the current-source error route. Map it to DECODE,
+not NETWORK: failure to establish the requested media position does not
+identify a transport failure. Cancellation and known network codes retain
+their existing meanings. Synchronous argument rejection before flushing is
+unchanged.
+
+Keep source identity/generation checks, one user-visible error per source,
+command completion without a successful Started/Seeked event, and manual
+SetSource/reopen recovery. No EOF synthesis, automatic retry, new channel,
+or generic failed-MEError forwarding is added. This closes a source-proven
+error-propagation gap, not a proven cause of the episode #331 stalls.
+
+The licenses of the modified Wine source files apply to this patch.
+---
+diff --git a/dlls/winedmo/media_source.c b/dlls/winedmo/media_source.c
+--- a/dlls/winedmo/media_source.c
++++ b/dlls/winedmo/media_source.c
+@@ -1359,19 +1359,16 @@ static HRESULT media_source_start(struct media_source *source, IMFPresentationDescriptor *descriptor,
+             /* Cancellation or seek failed after the old queues were flushed.
+              * Keep the epoch odd and stop the producer rather than retrying an
+              * unknown or damaged timeline. */
+-            if (error == MF_E_OPERATION_CANCELLED || error == MF_E_NET_TIMEOUT
+-                    || error == MF_E_NET_READ)
++            if (error != MF_E_OPERATION_CANCELLED && error != MF_E_NET_TIMEOUT
++                    && error != MF_E_NET_READ)
+             {
+-                *error_queued = media_source_queue_demux_error(source, error);
+-                if (!*error_queued && error_event_generation != InterlockedCompareExchange(
+-                        &source->demux_error_event_generation, 0, 0))
+-                    *error_queued = TRUE;
+-            }
+-            else
+-            {
+-                source->demux_thread_shutdown = true;
+-                media_source_set_demux_error(source, error);
++                WARN("Failed to establish seek position, original error %#lx; stopping source.\n", error);
++                error = MF_E_INVALID_POSITION;
+             }
++            *error_queued = media_source_queue_demux_error(source, error);
++            if (!*error_queued && error_event_generation != InterlockedCompareExchange(
++                    &source->demux_error_event_generation, 0, 0))
++                *error_queued = TRUE;
+             for (i = 0; i < source->stream_count; i++)
+             {
+                 struct media_stream *stream = source->streams[i];
+diff --git a/dlls/mf/session.c b/dlls/mf/session.c
+--- a/dlls/mf/session.c
++++ b/dlls/mf/session.c
+@@ -4881,7 +4881,7 @@ static HRESULT WINAPI session_events_callback_Invoke(IMFAsyncCallback *iface, IMFAsyncResult *result)
+                 if (hr == MF_E_SHUTDOWN)
+                     session_handle_source_shutdown(session);
+                 else if (hr == MF_E_OPERATION_CANCELLED || hr == MF_E_NET_TIMEOUT
+-                        || hr == MF_E_NET_READ)
++                        || hr == MF_E_NET_READ || hr == MF_E_INVALID_POSITION)
+                 {
+                     if (!(session_source->flags & SOURCE_FLAG_TERMINAL_ERROR_FORWARDED))
+                     {
+diff --git a/dlls/mfmediaengine/main.c b/dlls/mfmediaengine/main.c
+--- a/dlls/mfmediaengine/main.c
++++ b/dlls/mfmediaengine/main.c
+@@ -1212,7 +1212,7 @@ static HRESULT WINAPI media_engine_session_events_Invoke(IMFAsyncCallback *iface, IMFAsyncResult *result)
+ 
+             if (FAILED(IMFMediaEvent_GetStatus(event, &error)) ||
+                     (error != MF_E_OPERATION_CANCELLED && error != MF_E_NET_TIMEOUT
+-                    && error != MF_E_NET_READ) ||
++                    && error != MF_E_NET_READ && error != MF_E_INVALID_POSITION) ||
+                     FAILED(IMFMediaEvent_GetValue(event, &source)) ||
+                     source.vt != VT_UNKNOWN || !source.punkVal)
+             {
+@@ -1220,8 +1220,12 @@ static HRESULT WINAPI media_engine_session_events_Invoke(IMFAsyncCallback *iface, IMFAsyncResult *result)
+                 break;
+             }
+ 
+-            error_code = error == MF_E_OPERATION_CANCELLED
+-                    ? MF_MEDIA_ENGINE_ERR_ABORTED : MF_MEDIA_ENGINE_ERR_NETWORK;
++            if (error == MF_E_OPERATION_CANCELLED)
++                error_code = MF_MEDIA_ENGINE_ERR_ABORTED;
++            else if (error == MF_E_INVALID_POSITION)
++                error_code = MF_MEDIA_ENGINE_ERR_DECODE;
++            else
++                error_code = MF_MEDIA_ENGINE_ERR_NETWORK;
+             EnterCriticalSection(&engine->cs);
+             if ((engine->flags & FLAGS_ENGINE_SHUT_DOWN)
+                     || engine->presentation.generation != engine->source_generation

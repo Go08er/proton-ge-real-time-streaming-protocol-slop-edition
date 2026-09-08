@@ -1,0 +1,146 @@
+From d4e271226c0ab818c295c4378980582059ea885c Mon Sep 17 00:00:00 2001
+From: RTSP-on-GE design <rtsp-on-ge@example.invalid>
+Date: Sun, 26 Jul 2026 12:05:00 -0500
+Subject: [PATCH] mf: order immediate replacement presentation startup
+
+An immediate topology replacement installs stopped source nodes while the
+MediaSession and its presentation clock can still be started. Treating that
+presentation as a running restart stops unsubscribed new sources; attaching
+replacement sinks to the live old clock lets clock notifications overtake
+preroll.
+
+Treat an all-stopped replacement as a fresh presentation. Detach outgoing
+sinks, stop the physical clock before replacement sinks attach, route the new
+sources through the subscribed stopped-state start path, and consume only the
+initial clock-stop notification delivered to each new output. Ordinary
+running seeks keep the existing asynchronous stop/restart path.
+
+This is the byte-identical final source produced by the former two-step 0015
+then 0016 development sequence; only its patch context is regenerated after
+removing diagnostic Patch 0012.
+
+A3.19: rebased after GE-Proton11-6's ge-video-rework set.
+---
+diff --git a/dlls/mf/session.c b/dlls/mf/session.c
+index 175d143758fb781ce8dcc85510c42f0d74858b24..efce5a64b6cda8f20eab26e70bd63f03ca9bb8b9 100644
+--- a/dlls/mf/session.c
++++ b/dlls/mf/session.c
+@@ -187,6 +187,7 @@ enum topo_node_flags
+     TOPO_NODE_SCRUB_SAMPLE_COMPLETE = 0x2,
+     TOPO_NODE_MARKIN_HERE = 0x4,
+     TOPO_NODE_TRANSFORM_NEEDS_INPUT = 0x8,
++    TOPO_NODE_EXPECT_INITIAL_CLOCK_STOP = 0x10,
+ };
+ 
+ struct topo_node
+@@ -927,6 +928,7 @@ static void session_clear_presentation(struct media_session *session)
+     struct media_source *source, *source2;
+     struct media_sink *sink, *sink2;
+     struct topo_node *node, *node2;
++    HRESULT hr;
+ 
+     IMFTopology_Clear(session->presentation.current_topology);
+     session->presentation.topo_status = MF_TOPOSTATUS_INVALID;
+@@ -949,7 +951,11 @@ static void session_clear_presentation(struct media_session *session)
+         list_remove(&sink->entry);
+ 
+         if (sink->sink)
++        {
++            if (FAILED(hr = IMFMediaSink_SetPresentationClock(sink->sink, NULL)))
++                WARN("Failed to detach presentation clock from sink %p, hr %#lx.\n", sink->sink, hr);
+             IMFMediaSink_Release(sink->sink);
++        }
+         if (sink->preroll)
+             IMFMediaSinkPreroll_Release(sink->preroll);
+         if (sink->event_generator)
+@@ -1132,6 +1138,7 @@ static void session_flush_sinks(struct media_session *session)
+ 
+ static HRESULT session_get_stream_sink_type(IMFStreamSink *sink, IMFMediaType **media_type);
+ static HRESULT session_start_clock(struct media_session *session);
++static BOOL session_is_source_nodes_state(struct media_session *session, enum object_state state);
+ 
+ static void session_flush_nodes(struct media_session *session)
+ {
+@@ -1152,15 +1159,17 @@ static void session_start(struct media_session *session, const GUID *time_format
+ {
+     struct media_source *source;
+     struct topo_node *topo_node;
+-    BOOL keep_position;
++    BOOL keep_position, sources_stopped;
++    MFCLOCK_STATE clock_state;
+     MFTIME duration;
+     HRESULT hr;
+     UINT i;
+ 
+     keep_position = IsEqualGUID(time_format, &GUID_NULL) && start_position->vt == VT_EMPTY;
++    sources_stopped = session_is_source_nodes_state(session, OBJ_STATE_STOPPED);
+ 
+     /* No position change - nothing to do. */
+-    if (session->state == SESSION_STATE_STARTED && keep_position)
++    if (session->state == SESSION_STATE_STARTED && keep_position && !sources_stopped)
+     {
+         hr = session_start_clock(session);
+         session_command_complete_with_event(session, MESessionStarted, hr, NULL);
+@@ -1171,7 +1180,34 @@ static void session_start(struct media_session *session, const GUID *time_format
+     {
+         case SESSION_STATE_PAUSED:
+         case SESSION_STATE_STARTED:
+-            if (!keep_position)
++            if (sources_stopped)
++            {
++                /* An immediate replacement is a fresh, not a running, presentation. */
++                if (FAILED(hr = IMFPresentationClock_GetState(session->clock, 0, &clock_state)))
++                {
++                    WARN("Failed to get replacement presentation clock state %p, hr %#lx.\n", session, hr);
++                    session_command_complete_with_event(session, MESessionStarted, hr, NULL);
++                    return;
++                }
++                if (clock_state != MFCLOCK_STATE_INVALID)
++                {
++                    if (clock_state != MFCLOCK_STATE_STOPPED &&
++                            FAILED(hr = IMFPresentationClock_Stop(session->clock)))
++                    {
++                        WARN("Failed to stop replacement presentation clock %p, hr %#lx.\n", session, hr);
++                        session_command_complete_with_event(session, MESessionStarted, hr, NULL);
++                        return;
++                    }
++                    LIST_FOR_EACH_ENTRY(topo_node, &session->presentation.nodes, struct topo_node, entry)
++                    {
++                        if (topo_node->type == MF_TOPOLOGY_OUTPUT_NODE)
++                            topo_node->flags |= TOPO_NODE_EXPECT_INITIAL_CLOCK_STOP;
++                    }
++                }
++                session->state = SESSION_STATE_STOPPED;
++                session->clock_started = FALSE;
++            }
++            else if (!keep_position)
+             {
+                 session->command_state = COMMAND_STATE_RESTARTING_SOURCES;
+ 
+@@ -3450,10 +3486,24 @@ static void session_set_sink_stream_state(struct media_session *session, IMFStre
+         MediaEventType event_type)
+ {
+     struct media_source *source;
++    struct topo_node *node;
+     enum object_state state;
+     HRESULT hr = S_OK;
+     BOOL changed;
+ 
++    if ((node = session_get_node_object(session, (IUnknown *)stream, MF_TOPOLOGY_OUTPUT_NODE)) &&
++            node->flags & TOPO_NODE_EXPECT_INITIAL_CLOCK_STOP)
++    {
++        if (event_type == MEStreamSinkStopped)
++        {
++            node->flags &= ~TOPO_NODE_EXPECT_INITIAL_CLOCK_STOP;
++            TRACE("Ignoring initial sink Stop for replacement session %p.\n", session);
++            return;
++        }
++        if (event_type == MEStreamSinkStarted)
++            node->flags &= ~TOPO_NODE_EXPECT_INITIAL_CLOCK_STOP;
++    }
++
+     if ((state = session_get_object_state_for_event(event_type)) == OBJ_STATE_INVALID)
+         return;
+ 
+-- 
+2.51.0

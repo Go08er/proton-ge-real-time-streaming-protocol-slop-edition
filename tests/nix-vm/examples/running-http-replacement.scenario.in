@@ -1,0 +1,24 @@
+# SPDX-License-Identifier: BSD-3-Clause
+# Let generation one reach steady running playback before replacing it. Four
+# wall-clock-spaced snapshots on both sides make a retained old clock or an
+# unstarted replacement topology fail even if wait_time returns immediately.
+load "http://127.0.0.1:18765/media?generation=one"
+wait_event CANPLAY 15000
+play
+wait_event PLAYING 5000
+wait_time @STARTUP_WAIT@ 5000
+loop 4
+wait_ms 1000
+snapshot "http-running-g1"
+endloop
+
+replace "http://127.0.0.1:18765/media?generation=two"
+wait_event CANPLAY 15000
+play
+wait_event PLAYING 5000
+wait_time @STARTUP_WAIT@ 5000
+loop 4
+wait_ms 1000
+snapshot "http-running-g2"
+endloop
+shutdown

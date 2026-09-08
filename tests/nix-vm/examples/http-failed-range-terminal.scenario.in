@@ -1,0 +1,14 @@
+# SPDX-License-Identifier: BSD-3-Clause
+# The fixture accepts the opening body and returns one 503 to the later Range.
+# A terminal MediaEngine error is the expected bounded product outcome.
+load "http://127.0.0.1:18765/media?case=http-failed-range-terminal"
+wait_event CANPLAY 15000
+play
+wait_event PLAYING 5000
+wait_time @STARTUP_WAIT@ 5000
+wait_time @INITIAL_WAIT@ 20000
+snapshot "pre-failure-steady"
+seek @FAILED_SEEK@
+wait_event ERROR 10000
+snapshot "failed-range-terminal"
+shutdown

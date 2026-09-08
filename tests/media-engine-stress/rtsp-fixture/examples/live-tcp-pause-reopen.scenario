@@ -1,0 +1,35 @@
+# SPDX-License-Identifier: BSD-3-Clause
+# Diagnostic companion to live-tcp-reopen.scenario. Pausing before each source
+# replacement moves the existing MediaSession out of STARTED and distinguishes
+# the STARTED + VT_EMPTY early-return failure from RTSP transport failure.
+load "rtsp://127.0.0.1:18554/fixture"
+wait_event CANPLAY 20000
+play
+wait_event PLAYING 10000
+loop 4
+wait_ms 1000
+snapshot "rtsp-live-g1"
+endloop
+pause
+wait_event PAUSE 5000
+
+replace "rtsp://127.0.0.1:18554/fixture"
+wait_event CANPLAY 20000
+play
+wait_event PLAYING 10000
+loop 4
+wait_ms 1000
+snapshot "rtsp-live-g2"
+endloop
+pause
+wait_event PAUSE 5000
+
+replace "rtsp://127.0.0.1:18554/fixture"
+wait_event CANPLAY 20000
+play
+wait_event PLAYING 10000
+loop 4
+wait_ms 1000
+snapshot "rtsp-live-g3"
+endloop
+shutdown

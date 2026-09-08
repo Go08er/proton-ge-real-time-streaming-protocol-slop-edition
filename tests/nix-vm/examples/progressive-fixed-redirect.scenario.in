@@ -1,0 +1,14 @@
+# SPDX-License-Identifier: BSD-3-Clause
+# The only source URL is the fixture's fixed 307 route.  Playback and the far
+# seek therefore prove behavior of the redirect target, not a direct bypass.
+load "http://127.0.0.1:18765/media?case=progressive-fixed-redirect"
+wait_event CANPLAY 15000
+play
+wait_event PLAYING 5000
+wait_time @STARTUP_WAIT@ 5000
+wait_time @INITIAL_WAIT@ 20000
+seek @REDIRECT_SEEK@
+wait_event SEEKED 5000
+wait_time @REDIRECT_WAIT@ 5000
+snapshot "redirect-post-seek-steady"
+shutdown

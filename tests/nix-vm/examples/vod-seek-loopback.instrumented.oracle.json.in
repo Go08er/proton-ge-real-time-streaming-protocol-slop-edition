@@ -1,0 +1,77 @@
+{
+  "audio_check_labels": [
+    "post-seek-steady"
+  ],
+  "event_order": [
+    "CANPLAY",
+    "PLAYING",
+    "SEEKING",
+    "SEEKED",
+    "PAUSE",
+    "PLAYING"
+  ],
+  "expected_driver_sha256": "@DRIVER_SHA256@",
+  "expected_exit_code": 0,
+  "expected_result": "pass",
+  "expected_scenario_sha256": "@SCENARIO_SHA256@",
+  "forbidden_events": [
+    "ERROR",
+    "STREAMRENDERINGERROR"
+  ],
+  "max_audio_nonzero_silence_ms": 750,
+  "max_audio_silence_ms": 750,
+  "max_media_error_events": 0,
+  "max_time_regression": 0.1,
+  "max_timeout_snapshots": 0,
+  "min_action_counts": {
+    "seek": 8,
+    "snapshot": 9,
+    "wait_event": 12,
+    "wait_time": 10
+  },
+  "min_audio_bytes_generation": 4096,
+  "min_audio_nonzero_units_generation": 20,
+  "min_audio_samples_generation": 10,
+  "min_playback_advance": 1.0,
+  "min_post_seek_advance": 0.75,
+  "min_post_seek_audio_bytes": 4096,
+  "min_post_seek_audio_samples": 10,
+  "min_post_seek_nonzero_units": 20,
+  "min_source_generations": 1,
+  "require_audio_each_generation": true,
+  "require_av_same_snapshot_each_generation": true,
+  "require_seek_completion": true,
+  "require_video_each_generation": true,
+  "required_actions": [
+    "load",
+    "play",
+    "seek",
+    "pause",
+    "shutdown"
+  ],
+  "required_audio_payload_formats": [
+    "pcm16",
+    "pcm32",
+    "float32"
+  ],
+  "required_events": [
+    "CANPLAY",
+    "PLAYING",
+    "SEEKED",
+    "PAUSE"
+  ],
+  "required_events_per_generation": [
+    "CANPLAY"
+  ],
+  "required_seek_targets": [
+    @FORWARD_SEEK@,
+    @BACKWARD_SEEK@,
+    @FORWARD_SEEK@,
+    @BACKWARD_SEEK@,
+    @FORWARD_SEEK@,
+    @BACKWARD_SEEK@,
+    @FORWARD_SEEK@,
+    @BACKWARD_SEEK@
+  ],
+  "seek_target_tolerance": 0.5
+}

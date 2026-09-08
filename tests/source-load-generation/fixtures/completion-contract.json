@@ -1,0 +1,54 @@
+{
+  "target_files": [
+    "dlls/mfmediaengine/main.c",
+    "dlls/winedmo/media_source.c"
+  ],
+  "excluded_tokens": [
+    "case MEError:",
+    "MF_MEDIA_ENGINE_ERR_DECODE",
+    "forward_error = TRUE"
+  ],
+  "begin_end_pairs": [
+    {
+      "origin": "MEDIA_ENGINE_LOAD_EXTENSION",
+      "begin": "IMFMediaEngineExtension_BeginCreateObject",
+      "end": "IMFMediaEngineExtension_EndCreateObject"
+    },
+    {
+      "origin": "MEDIA_ENGINE_LOAD_URL",
+      "begin": "IMFSourceResolver_BeginCreateObjectFromURL",
+      "end": "IMFSourceResolver_EndCreateObjectFromURL"
+    },
+    {
+      "origin": "MEDIA_ENGINE_LOAD_BYTESTREAM",
+      "begin": "IMFSourceResolver_BeginCreateObjectFromByteStream",
+      "end": "IMFSourceResolver_EndCreateObjectFromByteStream"
+    }
+  ],
+  "completion_cases": [
+    {
+      "name": "current",
+      "shutdown": false,
+      "generation_matches": true,
+      "expected": "install"
+    },
+    {
+      "name": "stale",
+      "shutdown": false,
+      "generation_matches": false,
+      "expected": "shutdown_release"
+    },
+    {
+      "name": "shutdown",
+      "shutdown": true,
+      "generation_matches": true,
+      "expected": "shutdown_release"
+    },
+    {
+      "name": "stale_during_shutdown",
+      "shutdown": true,
+      "generation_matches": false,
+      "expected": "shutdown_release"
+    }
+  ]
+}

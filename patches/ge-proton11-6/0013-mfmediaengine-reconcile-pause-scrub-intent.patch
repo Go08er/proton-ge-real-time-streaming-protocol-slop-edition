@@ -1,0 +1,106 @@
+From dd6001a556658fcb4958bb730376c2d1fcffbffa Mon Sep 17 00:00:00 2001
+From: RTSP-on-GE design <rtsp-on-ge@example.invalid>
+Date: Tue, 21 Jul 2026 20:14:00 -0500
+Subject: [PATCH] mfmediaengine: reconcile pause and scrub intent
+
+An application Pause can arrive while MediaEngine is producing its initial
+scrub frame. GE's pending-pause branch is mutually exclusive with its scrub
+branch, so the pause is never reconciled. A later rate event consumes the
+older PLAY_PENDING flag and starts the session while PAUSED and PAUSE_PENDING
+remain visible to the caller.
+
+Make playback_requested the latest explicit-intent authority. Clear stale
+play and waiting state from Pause, reconcile a pending pause even during
+scrubbing, and give the nonzero rate event sole ownership of a post-scrub
+restart. Do not consume a newer pending pause from an older rate completion.
+
+A3.19: rebased after GE-Proton11-6's ge-video-rework set.
+Retain latest explicit Pause intent while preserving GE's duplicate-scrub-pause suppression and autoplay through Play.
+---
+diff --git a/dlls/mfmediaengine/main.c b/dlls/mfmediaengine/main.c
+index 5af8724ac916d355c87a04bd4332d06ca1bc2e0b..6bb3a8aa6ccc87859d247fa630fe9d73709ec1e5 100644
+--- a/dlls/mfmediaengine/main.c
++++ b/dlls/mfmediaengine/main.c
+@@ -1232,13 +1232,23 @@ static HRESULT WINAPI media_engine_session_events_Invoke(IMFAsyncCallback *iface
+                 }
+                 else
+                 {
+-                    /* Scrubbing is complete */
+                     WARN("Completing scrub at rate %.3f, flags %#x.\n", rate.fltVal, engine->flags);
++                    /* A caller Pause supersedes an older pending Play. A
++                     * newer pending Pause is completed only by its Paused
++                     * event; this older rate event must not consume it. */
+                     media_engine_set_flag(engine, FLAGS_ENGINE_SCRUBBING, FALSE);
+-                    if (engine->flags & FLAGS_ENGINE_PLAY_PENDING)
++                    if (!engine->playback_requested)
+                     {
+-                        media_engine_set_flag(engine, FLAGS_ENGINE_PLAY_PENDING | FLAGS_ENGINE_PAUSE_PENDING
+-                                | FLAGS_ENGINE_PAUSED, FALSE);
++                        media_engine_set_flag(engine, FLAGS_ENGINE_PLAY_PENDING | FLAGS_ENGINE_WAITING, FALSE);
++                        media_engine_set_flag(engine, FLAGS_ENGINE_PAUSED, TRUE);
++                    }
++                    else if (engine->flags & FLAGS_ENGINE_PAUSE_PENDING)
++                    {
++                        media_engine_set_flag(engine, FLAGS_ENGINE_PLAY_PENDING, TRUE);
++                    }
++                    else if (engine->flags & FLAGS_ENGINE_PLAY_PENDING)
++                    {
++                        media_engine_set_flag(engine, FLAGS_ENGINE_PLAY_PENDING | FLAGS_ENGINE_PAUSED, FALSE);
+                         media_engine_start_playback(engine);
+                     }
+                 }
+@@ -1257,14 +1267,32 @@ static HRESULT WINAPI media_engine_session_events_Invoke(IMFAsyncCallback *iface
+             break;
+ 
+         case MESessionPaused:
++        {
++            BOOL scrubbing;
+ 
+             EnterCriticalSection(&engine->cs);
+-            if (engine->flags & FLAGS_ENGINE_SCRUBBING)
++            scrubbing = !!(engine->flags & FLAGS_ENGINE_SCRUBBING);
++            if (scrubbing)
+                 media_engine_set_rate(engine, FALSE, engine->default_playback_rate);
+-            else if (engine->flags & FLAGS_ENGINE_PAUSE_PENDING)
++
++            /* Scrubbing and an application pause can overlap. Reconcile both;
++             * making these branches mutually exclusive strands PAUSE_PENDING
++             * after the rate-change event starts the presentation. */
++            if (engine->flags & FLAGS_ENGINE_PAUSE_PENDING)
+             {
+                 media_engine_set_flag(engine, FLAGS_ENGINE_PAUSE_PENDING, FALSE);
+-                if (engine->flags & FLAGS_ENGINE_PLAY_PENDING)
++                if (!engine->playback_requested)
++                {
++                    media_engine_set_flag(engine, FLAGS_ENGINE_PLAY_PENDING | FLAGS_ENGINE_WAITING, FALSE);
++                    media_engine_set_flag(engine, FLAGS_ENGINE_PAUSED, TRUE);
++                }
++                else if (scrubbing)
++                {
++                    /* The nonzero rate event owns the post-scrub restart. */
++                    media_engine_set_flag(engine, FLAGS_ENGINE_PLAY_PENDING, TRUE);
++                    media_engine_set_flag(engine, FLAGS_ENGINE_PAUSED, FALSE);
++                }
++                else
+                 {
+                     media_engine_set_flag(engine, FLAGS_ENGINE_PLAY_PENDING | FLAGS_ENGINE_PAUSED, FALSE);
+                     start_pending = TRUE;
+@@ -1274,6 +1302,7 @@ static HRESULT WINAPI media_engine_session_events_Invoke(IMFAsyncCallback *iface
+                 media_engine_start_playback(engine);
+             LeaveCriticalSection(&engine->cs);
+             break;
++        }
+     }
+ 
+ failed:
+@@ -3168,9 +3197,9 @@ static HRESULT WINAPI media_engine_Pause(IMFMediaEngineEx *iface)
+     else
+     {
+         engine->playback_requested = FALSE;
++        media_engine_set_flag(engine, FLAGS_ENGINE_PLAY_PENDING | FLAGS_ENGINE_WAITING, FALSE);
+         if (engine->flags & FLAGS_ENGINE_PAUSE_PENDING)
+         {
+-            media_engine_set_flag(engine, FLAGS_ENGINE_PLAY_PENDING, FALSE);
+             media_engine_set_flag(engine, FLAGS_ENGINE_PAUSED, TRUE);
+         }
+         else if (!(engine->flags & FLAGS_ENGINE_PAUSED))

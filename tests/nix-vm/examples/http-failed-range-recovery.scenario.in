@@ -1,0 +1,21 @@
+# SPDX-License-Identifier: BSD-3-Clause
+# The first source opens normally, then every later /media Range GET fails.
+# A new SetSource to the independently healthy /recovery route must clear the
+# terminal error and advance a fresh generation from zero.
+load "http://127.0.0.1:18765/media?case=http-failed-range-recovery"
+wait_event CANPLAY 15000
+play
+wait_event PLAYING 5000
+wait_time @STARTUP_WAIT@ 5000
+wait_time @INITIAL_WAIT@ 20000
+snapshot "pre-failure-steady"
+seek @FAILED_SEEK@
+wait_event ERROR 10000
+snapshot "failed-range-terminal"
+replace "http://127.0.0.1:18765/recovery?case=http-failed-range-recovery"
+wait_event CANPLAY 15000
+play
+wait_event FIRSTFRAMEREADY 5000
+wait_time @RECOVERY_WAIT@ 10000
+snapshot "recovery-generation-steady"
+shutdown

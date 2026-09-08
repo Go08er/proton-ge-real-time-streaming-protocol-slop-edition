@@ -1,0 +1,672 @@
+From: RTSP-on-GE11 contributors <noreply@invalid>
+Subject: [PATCH] media: keep GE playback diagnostics quiet and privacy-safe
+
+GE 11-6's live diagnostics scan pixels and force staging-texture readbacks
+even with WINEDEBUG=-all. Remove those diagnostic-only operations and the
+client-texture probe that prints the complete source URL. Keep the actual
+cross-device, system-memory, and same-device transfer paths unchanged.
+
+Use the existing trace level for GE's routine state/query chatter rather
+than warning on normal playback. No channel is added; broad mfplat tracing
+remains unsupported for sessions. Also omit the URL from the unknown-MIME
+message, which RTSP's unlisted MIME can reach. True failure warnings remain.
+
+This does not change queues, clocks, retry policy, or playback algorithms.
+---
+diff --git a/dlls/mfmediaengine/main.c b/dlls/mfmediaengine/main.c
+index 81c8be1d9c8ed602421540853c56d6394aef429a..c8ce3d3a7c7dcd7e2794d5d845f5d233003a8949 100644
+--- a/dlls/mfmediaengine/main.c
++++ b/dlls/mfmediaengine/main.c
+@@ -261,7 +261,7 @@ static HRESULT media_engine_notify_live_event(struct media_engine *engine,
+     HRESULT hr = IMFMediaEngineNotify_EventNotify(engine->callback, event, param1, param2);
+ 
+     if (isinf(engine->duration))
+-        WARN("Live client notification %u: callback hr %#lx, param1 %s, param2 %#lx, "
++        TRACE("Live client notification %u: callback hr %#lx, param1 %s, param2 %#lx, "
+                 "flags %#x, ready %u, network %u.\n", event, hr,
+                 wine_dbgstr_longlong(param1), param2, engine->flags,
+                 engine->ready_state, engine->network_state);
+@@ -712,7 +712,7 @@ static DWORD WINAPI time_range_GetLength(IMFMediaTimeRange *iface)
+         }
+ 
+         if (count <= 32 || !range->count)
+-            WARN("Live buffered length call %ld: range %p, length %Iu, first %.6f-%.6f.\n",
++            TRACE("Live buffered length call %ld: range %p, length %Iu, first %.6f-%.6f.\n",
+                     count, iface, range->count, start, end);
+     }
+ 
+@@ -1106,7 +1106,7 @@ static HRESULT WINAPI media_engine_session_events_Invoke(IMFAsyncCallback *iface
+     if (event_type == MESessionTopologyStatus || event_type == MESessionStarted
+             || event_type == MESessionRateChanged || event_type == MESessionScrubSampleComplete
+             || event_type == MESessionPaused)
+-        WARN("Live playback event %lu, flags %#x, ready %u, network %u.\n", event_type,
++        TRACE("Live playback event %lu, flags %#x, ready %u, network %u.\n", event_type,
+                 engine->flags, engine->ready_state, engine->network_state);
+ 
+     switch (event_type)
+@@ -1191,7 +1191,7 @@ static HRESULT WINAPI media_engine_session_events_Invoke(IMFAsyncCallback *iface
+             }
+             if (restart_playback && !(engine->flags & FLAGS_ENGINE_SEEKING))
+                 media_engine_start_playback(engine);
+-            WARN("Session started, notify playing %u, flags %#x.\n", playing_event, engine->flags);
++            TRACE("Session started, notify playing %u, flags %#x.\n", playing_event, engine->flags);
+             LeaveCriticalSection(&engine->cs);
+             if (playing_event)
+                 media_engine_notify_live_event(engine, MF_MEDIA_ENGINE_EVENT_PLAYING, 0, 0);
+@@ -1273,12 +1273,12 @@ static HRESULT WINAPI media_engine_session_events_Invoke(IMFAsyncCallback *iface
+                 if (rate.fltVal == 0.0)
+                 {
+                     /* Start playback with rate at 0.0 */
+-                    WARN("Starting zero-rate scrub, flags %#x.\n", engine->flags);
++                    TRACE("Starting zero-rate scrub, flags %#x.\n", engine->flags);
+                     media_engine_start_playback(engine);
+                 }
+                 else
+                 {
+-                    WARN("Completing scrub at rate %.3f, flags %#x.\n", rate.fltVal, engine->flags);
++                    TRACE("Completing scrub at rate %.3f, flags %#x.\n", rate.fltVal, engine->flags);
+                     /* A caller Pause supersedes an older pending Play. A
+                      * newer pending Pause is completed only by its Paused
+                      * event; this older rate event must not consume it. */
+@@ -1390,7 +1390,7 @@ static HRESULT WINAPI media_engine_sink_events_Invoke(IMFAsyncCallback *iface, I
+ 
+     EnterCriticalSection(&engine->cs);
+ 
+-    WARN("Media Engine sink event %u, flags %#x, ready %u, network %u, duration %.6f.\n",
++    TRACE("Media Engine sink event %u, flags %#x, ready %u, network %u, duration %.6f.\n",
+             event, engine->flags, engine->ready_state, engine->network_state, engine->duration);
+ 
+     switch (event)
+@@ -1562,7 +1562,7 @@ static HRESULT media_engine_create_video_renderer(struct media_engine *engine, I
+     IMFMediaType_SetGUID(media_type, &MF_MT_SUBTYPE, &subtype);
+ 
+     if (isinf(engine->duration))
+-        WARN("Using a system-memory video sink for live media.\n");
++        TRACE("Using a system-memory video sink for live media.\n");
+     hr = create_video_frame_sink(media_type,
+             isinf(engine->duration) ? NULL : (IUnknown *)engine->device_manager,
+             &engine->sink_events, &engine->presentation.frame_sink);
+@@ -1817,7 +1817,7 @@ static HRESULT media_engine_create_topology(struct media_engine *engine, IMFMedi
+ 
+ static void media_engine_start_playback(struct media_engine *engine)
+ {
+-    WARN("Starting media session, flags %#x, position type %u.\n", engine->flags,
++    TRACE("Starting media session, flags %#x, position type %u.\n", engine->flags,
+             engine->presentation.start_position.vt);
+     IMFMediaSession_Start(engine->session, &GUID_NULL, &engine->presentation.start_position);
+     /* Reset the playback position to the current position */
+@@ -2145,7 +2145,7 @@ static HRESULT WINAPI media_engine_GetError(IMFMediaEngineEx *iface, IMFMediaErr
+         LONG count = InterlockedIncrement(&live_get_error_count);
+ 
+         if (count <= 16 || error_code || FAILED(hr))
+-            WARN("Live GetError call %ld: hr %#lx, error %u, extended %#lx, object %p.\n",
++            TRACE("Live GetError call %ld: hr %#lx, error %u, extended %#lx, object %p.\n",
+                     count, hr, error_code, extended_code, *error);
+     }
+ 
+@@ -2363,7 +2363,7 @@ static USHORT WINAPI media_engine_GetNetworkState(IMFMediaEngineEx *iface)
+         LONG count = InterlockedIncrement(&live_network_count);
+ 
+         if (count <= 16 || !(count % 120))
+-            WARN("Live network-state call %ld: %u, flags %#x.\n", count, state, flags);
++            TRACE("Live network-state call %ld: %u, flags %#x.\n", count, state, flags);
+     }
+ 
+     TRACE("%p returning %u flags %#x.\n", iface, state, flags);
+@@ -2431,7 +2431,7 @@ static HRESULT WINAPI media_engine_GetBuffered(IMFMediaEngineEx *iface, IMFMedia
+         LONG count = InterlockedIncrement(&live_buffered_count);
+ 
+         if (count <= 16 || !(count % 120) || FAILED(hr))
+-            WARN("Live buffered call %ld: hr %#lx, range %p, duration %.6f, flags %#x.\n",
++            TRACE("Live buffered call %ld: hr %#lx, range %p, duration %.6f, flags %#x.\n",
+                     count, hr, *range, duration, flags);
+     }
+ 
+@@ -2453,7 +2453,7 @@ static HRESULT WINAPI media_engine_Load(IMFMediaEngineEx *iface)
+     else
+         autoplay = !!(engine->flags & FLAGS_ENGINE_AUTO_PLAY);
+ 
+-    WARN("Load requested, autoplay %u, flags %#x, ready %u, network %u.\n", autoplay,
++    TRACE("Load requested, autoplay %u, flags %#x, ready %u, network %u.\n", autoplay,
+             engine->flags, engine->ready_state, engine->network_state);
+ 
+     LeaveCriticalSection(&engine->cs);
+@@ -2558,7 +2558,7 @@ static USHORT WINAPI media_engine_GetReadyState(IMFMediaEngineEx *iface)
+         LONG count = InterlockedIncrement(&live_ready_count);
+ 
+         if (count <= 16 || !(count % 120))
+-            WARN("Live ready-state call %ld: %u, flags %#x, network %u.\n",
++            TRACE("Live ready-state call %ld: %u, flags %#x, network %u.\n",
+                     count, state, engine->flags, engine->network_state);
+     }
+     TRACE("%p returning %u flags %#x.\n", iface, state, engine->flags);
+@@ -2580,7 +2580,7 @@ static BOOL WINAPI media_engine_IsSeeking(IMFMediaEngineEx *iface)
+         LONG count = InterlockedIncrement(&live_seeking_count);
+ 
+         if (count <= 16 || !(count % 120) || value)
+-            WARN("Live seeking call %ld: %u, flags %#x, ready %u, network %u.\n",
++            TRACE("Live seeking call %ld: %u, flags %#x, ready %u, network %u.\n",
+                     count, value, engine->flags, engine->ready_state, engine->network_state);
+     }
+     TRACE("%p returning %d flags %#x.\n", iface, value, engine->flags);
+@@ -2649,7 +2649,7 @@ static double WINAPI media_engine_GetCurrentTime(IMFMediaEngineEx *iface)
+         LONG count = InterlockedIncrement(&live_call_count);
+ 
+         if (count <= 16 || !(count % 120))
+-            WARN("Live current time call %ld: %.6f, flags %#x, ready %u, network %u.\n",
++            TRACE("Live current time call %ld: %.6f, flags %#x, ready %u, network %u.\n",
+                     count, ret, engine->flags, engine->ready_state, engine->network_state);
+     }
+     LeaveCriticalSection(&engine->cs);
+@@ -2938,7 +2938,7 @@ static double WINAPI media_engine_GetDuration(IMFMediaEngineEx *iface)
+         LONG count = InterlockedIncrement(&live_duration_count);
+ 
+         if (count <= 16 || !(count % 120))
+-            WARN("Live duration call %ld: internal %.6f, client %.6f, flags %#x.\n",
++            TRACE("Live duration call %ld: internal %.6f, client %.6f, flags %#x.\n",
+                     count, duration, value, flags);
+     }
+ 
+@@ -2965,7 +2965,7 @@ static BOOL WINAPI media_engine_IsPaused(IMFMediaEngineEx *iface)
+         LONG count = InterlockedIncrement(&live_paused_count);
+ 
+         if (count <= 16 || !(count % 120) || value)
+-            WARN("Live paused call %ld: %u, flags %#x.\n", count, value, flags);
++            TRACE("Live paused call %ld: %u, flags %#x.\n", count, value, flags);
+     }
+ 
+     return value;
+@@ -3064,7 +3064,7 @@ static HRESULT WINAPI media_engine_GetPlayed(IMFMediaEngineEx *iface, IMFMediaTi
+         LONG count = InterlockedIncrement(&live_played_count);
+ 
+         if (count <= 16 || !(count % 120))
+-            WARN("Live played call %ld: hr %#lx, output %p, flags %#x.\n",
++            TRACE("Live played call %ld: hr %#lx, output %p, flags %#x.\n",
+                     count, hr, played, flags);
+     }
+ 
+@@ -3116,7 +3116,7 @@ static HRESULT WINAPI media_engine_GetSeekable(IMFMediaEngineEx *iface, IMFMedia
+         LONG count = InterlockedIncrement(&live_seekable_count);
+ 
+         if (count <= 16 || !(count % 120) || FAILED(hr))
+-            WARN("Live seekable call %ld: hr %#lx, range %p, flags %#x.\n",
++            TRACE("Live seekable call %ld: hr %#lx, range %p, flags %#x.\n",
+                     count, hr, time_range, engine_flags);
+     }
+ 
+@@ -3197,7 +3197,7 @@ static HRESULT WINAPI media_engine_Play(IMFMediaEngineEx *iface)
+     HRESULT hr = S_OK;
+ 
+     EnterCriticalSection(&engine->cs);
+-    WARN("%p enter flags %#x ready %u network %u.\n", iface, engine->flags, engine->ready_state,
++    TRACE("%p enter flags %#x ready %u network %u.\n", iface, engine->flags, engine->ready_state,
+             engine->network_state);
+ 
+     if (engine->flags & FLAGS_ENGINE_SHUT_DOWN)
+@@ -3231,7 +3231,7 @@ static HRESULT WINAPI media_engine_Play(IMFMediaEngineEx *iface)
+         media_engine_notify_live_event(engine, MF_MEDIA_ENGINE_EVENT_WAITING, 0, 0);
+     }
+ 
+-    WARN("%p leave hr %#lx flags %#x ready %u network %u.\n", iface, hr, engine->flags,
++    TRACE("%p leave hr %#lx flags %#x ready %u network %u.\n", iface, hr, engine->flags,
+             engine->ready_state, engine->network_state);
+     LeaveCriticalSection(&engine->cs);
+ 
+@@ -3244,7 +3244,7 @@ static HRESULT WINAPI media_engine_Pause(IMFMediaEngineEx *iface)
+     HRESULT hr = S_OK;
+ 
+     EnterCriticalSection(&engine->cs);
+-    WARN("%p enter flags %#x ready %u network %u.\n", iface, engine->flags, engine->ready_state,
++    TRACE("%p enter flags %#x ready %u network %u.\n", iface, engine->flags, engine->ready_state,
+             engine->network_state);
+ 
+     if (engine->flags & FLAGS_ENGINE_SHUT_DOWN)
+@@ -3272,7 +3272,7 @@ static HRESULT WINAPI media_engine_Pause(IMFMediaEngineEx *iface)
+         IMFMediaEngineNotify_EventNotify(engine->callback, MF_MEDIA_ENGINE_EVENT_PURGEQUEUEDEVENTS, 0, 0);
+     }
+ 
+-    WARN("%p leave hr %#lx flags %#x ready %u network %u.\n", iface, hr, engine->flags,
++    TRACE("%p leave hr %#lx flags %#x ready %u network %u.\n", iface, hr, engine->flags,
+             engine->ready_state, engine->network_state);
+     LeaveCriticalSection(&engine->cs);
+ 
+@@ -3363,7 +3363,7 @@ static BOOL WINAPI media_engine_HasVideo(IMFMediaEngineEx *iface)
+         LONG count = InterlockedIncrement(&live_has_video_count);
+ 
+         if (count <= 8 || !(count % 120))
+-            WARN("Live HasVideo call %ld: %u, flags %#x.\n", count, value, engine->flags);
++            TRACE("Live HasVideo call %ld: %u, flags %#x.\n", count, value, engine->flags);
+     }
+     LeaveCriticalSection(&engine->cs);
+ 
+@@ -3385,7 +3385,7 @@ static BOOL WINAPI media_engine_HasAudio(IMFMediaEngineEx *iface)
+         LONG count = InterlockedIncrement(&live_has_audio_count);
+ 
+         if (count <= 8 || !(count % 120))
+-            WARN("Live HasAudio call %ld: %u, flags %#x.\n", count, value, engine->flags);
++            TRACE("Live HasAudio call %ld: %u, flags %#x.\n", count, value, engine->flags);
+     }
+     LeaveCriticalSection(&engine->cs);
+ 
+@@ -3430,7 +3430,7 @@ static HRESULT WINAPI media_engine_GetNativeVideoSize(IMFMediaEngineEx *iface, D
+         LONG count = InterlockedIncrement(&live_native_size_count);
+ 
+         if (count <= 16 || !(count % 120) || FAILED(hr))
+-            WARN("Live native-size call %ld: hr %#lx, %lux%lu, flags %#x.\n",
++            TRACE("Live native-size call %ld: hr %#lx, %lux%lu, flags %#x.\n",
+                     count, hr, width, height, flags);
+     }
+ 
+@@ -3475,7 +3475,7 @@ static HRESULT WINAPI media_engine_GetVideoAspectRatio(IMFMediaEngineEx *iface,
+         LONG count = InterlockedIncrement(&live_aspect_ratio_count);
+ 
+         if (count <= 16 || !(count % 120) || FAILED(hr))
+-            WARN("Live aspect-ratio call %ld: hr %#lx, %lu:%lu, flags %#x.\n",
++            TRACE("Live aspect-ratio call %ld: hr %#lx, %lu:%lu, flags %#x.\n",
+                     count, hr, width, height, flags);
+     }
+ 
+@@ -3588,7 +3588,6 @@ static HRESULT get_d3d11_resource_from_sample(IMFSample *sample, ID3D11Texture2D
+ 
+ static void media_engine_update_d3d11_frame_surface(ID3D11DeviceContext *context, struct media_engine *engine)
+ {
+-    static LONG live_render_upload_count;
+     D3D11_TEXTURE2D_DESC surface_desc;
+     D3D11_TEXTURE2D_DESC src_desc;
+     IMFMediaBuffer *media_buffer;
+@@ -3596,7 +3595,6 @@ static void media_engine_update_d3d11_frame_surface(ID3D11DeviceContext *context
+     ID3D11Device *device;
+     IMFSample *sample;
+     UINT subresource;
+-    LONG diagnostic_id = 0;
+     HRESULT hr;
+ 
+     if (!video_frame_sink_get_sample(engine->presentation.frame_sink, &sample))
+@@ -3636,41 +3634,8 @@ static void media_engine_update_d3d11_frame_surface(ID3D11DeviceContext *context
+         BYTE *buffer;
+         DWORD buffer_size;
+ 
+-        if (isinf(engine->duration))
+-            diagnostic_id = InterlockedIncrement(&live_render_upload_count);
+         if (SUCCEEDED(IMFMediaBuffer_Lock(media_buffer, &buffer, NULL, &buffer_size)))
+         {
+-            if (diagnostic_id && diagnostic_id <= 4)
+-            {
+-                UINT64 expected_size = (UINT64)surface_desc.Width * surface_desc.Height;
+-                ULONGLONG rgb_sum = 0, alpha_sum = 0;
+-                DWORD nonblack = 0, pixel_count = 0;
+-                UINT x, y;
+-
+-                if (buffer_size >= expected_size)
+-                {
+-                    for (y = 0; y < surface_desc.Height; y += 32)
+-                    {
+-                        const BYTE *row = buffer + y * surface_desc.Width;
+-
+-                        for (x = 0; x < surface_desc.Width; x += 32 * 4)
+-                        {
+-                            const BYTE *pixel = row + x;
+-                            DWORD rgb = pixel[0] + pixel[1] + pixel[2];
+-
+-                            rgb_sum += rgb;
+-                            alpha_sum += pixel[3];
+-                            nonblack += !!rgb;
+-                            ++pixel_count;
+-                        }
+-                    }
+-                }
+-                WARN("Live render upload %ld: buffer %lu, expected %s, row pitch %u, "
+-                        "RGB sum %s, alpha sum %s, nonblack %lu/%lu.\n", diagnostic_id,
+-                        buffer_size, wine_dbgstr_longlong(expected_size), surface_desc.Width,
+-                        wine_dbgstr_longlong(rgb_sum), wine_dbgstr_longlong(alpha_sum),
+-                        nonblack, pixel_count);
+-            }
+             if (buffer_size == surface_desc.Width * surface_desc.Height)
+             {
+                 ID3D11DeviceContext_UpdateSubresource(context, (ID3D11Resource *)engine->video_frame.d3d11.source,
+@@ -3746,32 +3711,6 @@ static HRESULT media_engine_transfer_d3d11_cross_device(IMFSample *sample, ID3D1
+         goto done;
+     }
+ 
+-    if (diagnostic_id && diagnostic_id <= 4)
+-    {
+-        ULONGLONG rgb_sum = 0, alpha_sum = 0;
+-        DWORD nonblack = 0, pixel_count = 0;
+-        UINT x, y;
+-
+-        for (y = src_box->top; y < src_box->bottom; y += 64)
+-        {
+-            const BYTE *row = scanline + y * pitch;
+-
+-            for (x = src_box->left; x < src_box->right; x += 64)
+-            {
+-                const BYTE *pixel = row + x * format_size;
+-                DWORD rgb = pixel[0] + pixel[1] + pixel[2];
+-
+-                rgb_sum += rgb;
+-                alpha_sum += pixel[3];
+-                nonblack += !!rgb;
+-                ++pixel_count;
+-            }
+-        }
+-        WARN("Live DXGI transfer %ld cross-device source: pitch %ld, buffer %lu, RGB sum %s, "
+-                "alpha sum %s, nonblack %lu/%lu.\n", diagnostic_id, pitch, buffer_length,
+-                wine_dbgstr_longlong(rgb_sum), wine_dbgstr_longlong(alpha_sum), nonblack, pixel_count);
+-    }
+-
+     src_data = scanline + src_box->top * pitch + src_box->left * format_size;
+     dst_box.left = dst_rect->left;
+     dst_box.top = dst_rect->top;
+@@ -3787,7 +3726,7 @@ static HRESULT media_engine_transfer_d3d11_cross_device(IMFSample *sample, ID3D1
+             0, &dst_box, src_data, pitch, 0);
+     hr = S_OK;
+     if (diagnostic_id && diagnostic_id <= 4)
+-        WARN("Live DXGI transfer %ld queued the cross-device upload.\n", diagnostic_id);
++        TRACE("Live DXGI transfer %ld queued the cross-device upload.\n", diagnostic_id);
+ 
+ done:
+     if (diagnostic_id && diagnostic_id <= 4 && FAILED(hr))
+@@ -3885,86 +3824,6 @@ done:
+     return hr;
+ }
+ 
+-static void media_engine_diagnose_live_texture_pixels(ID3D11Device *device,
+-        ID3D11DeviceContext *context, ID3D11Texture2D *texture, UINT subresource,
+-        const D3D11_TEXTURE2D_DESC *desc, const D3D11_BOX *box,
+-        LONG diagnostic_id, const char *name)
+-{
+-    D3D11_TEXTURE2D_DESC staging_desc = {0};
+-    D3D11_MAPPED_SUBRESOURCE mapped = {0};
+-    ID3D11Texture2D *staging = NULL;
+-    ULONGLONG rgb_sum = 0, alpha_sum = 0;
+-    DWORD nonblack = 0, pixel_count = 0;
+-    UINT format_size, width, height;
+-    BOOL mapped_texture = FALSE;
+-    UINT x, y;
+-    HRESULT hr = S_OK;
+-
+-    width = box->right - box->left;
+-    height = box->bottom - box->top;
+-    if (!(format_size = media_engine_get_d3d11_format_size(desc->Format))
+-            || desc->SampleDesc.Count != 1 || !width || !height)
+-    {
+-        hr = MF_E_INVALIDMEDIATYPE;
+-        goto done;
+-    }
+-
+-    staging_desc.Width = width;
+-    staging_desc.Height = height;
+-    staging_desc.MipLevels = 1;
+-    staging_desc.ArraySize = 1;
+-    staging_desc.Format = desc->Format;
+-    staging_desc.SampleDesc.Count = 1;
+-    staging_desc.Usage = D3D11_USAGE_STAGING;
+-    staging_desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+-
+-    if (FAILED(hr = ID3D11Device_CreateTexture2D(device, &staging_desc, NULL, &staging)))
+-        goto done;
+-
+-    ID3D11DeviceContext_CopySubresourceRegion(context, (ID3D11Resource *)staging, 0,
+-            0, 0, 0, (ID3D11Resource *)texture, subresource, box);
+-    if (FAILED(hr = ID3D11DeviceContext_Map(context, (ID3D11Resource *)staging,
+-            0, D3D11_MAP_READ, 0, &mapped)))
+-        goto done;
+-    mapped_texture = TRUE;
+-
+-    if (mapped.RowPitch < width * format_size)
+-    {
+-        hr = MF_E_UNEXPECTED;
+-        goto done;
+-    }
+-
+-    for (y = 0; y < height; y += 32)
+-    {
+-        const BYTE *row = (const BYTE *)mapped.pData + y * mapped.RowPitch;
+-
+-        for (x = 0; x < width; x += 32)
+-        {
+-            const BYTE *pixel = row + x * format_size;
+-            DWORD rgb = pixel[0] + pixel[1] + pixel[2];
+-
+-            rgb_sum += rgb;
+-            alpha_sum += pixel[3];
+-            nonblack += !!rgb;
+-            ++pixel_count;
+-        }
+-    }
+-
+-done:
+-    if (SUCCEEDED(hr))
+-        WARN("Live DXGI transfer %ld %s pixels: RGB sum %s, alpha sum %s, "
+-                "nonblack %lu/%lu, row pitch %u.\n", diagnostic_id, name,
+-                wine_dbgstr_longlong(rgb_sum), wine_dbgstr_longlong(alpha_sum),
+-                nonblack, pixel_count, mapped.RowPitch);
+-    else
+-        WARN("Live DXGI transfer %ld could not read back %s pixels, hr %#lx.\n",
+-                diagnostic_id, name, hr);
+-
+-    if (mapped_texture)
+-        ID3D11DeviceContext_Unmap(context, (ID3D11Resource *)staging, 0);
+-    if (staging)
+-        ID3D11Texture2D_Release(staging);
+-}
+ 
+ static HRESULT media_engine_transfer_d3d11(struct media_engine *engine, ID3D11Texture2D *dst_texture,
+         const MFVideoNormalizedRect *src_rect, const RECT *dst_rect, const MFARGB *color)
+@@ -3976,7 +3835,6 @@ static HRESULT media_engine_transfer_d3d11(struct media_engine *engine, ID3D11Te
+     ID3D11DeviceContext *context;
+     ID3D11Texture2D *src_texture;
+     RECT dst_rect_default = {0};
+-    D3D11_BOX dst_box = {0};
+     D3D11_BOX src_box = {0};
+     ID3D11Device *device, *src_device, *dst_device;
+     BOOL device_mismatch;
+@@ -4008,7 +3866,7 @@ static HRESULT media_engine_transfer_d3d11(struct media_engine *engine, ID3D11Te
+     if (isinf(engine->duration))
+         diagnostic_id = InterlockedIncrement(&live_dxgi_transfer_count);
+     if (diagnostic_id && diagnostic_id <= 4)
+-        WARN("Live DXGI transfer %ld: source %ux%u format %#x, usage %u, bind %#x, cpu %#x, misc %#x, "
++        TRACE("Live DXGI transfer %ld: source %ux%u format %#x, usage %u, bind %#x, cpu %#x, misc %#x, "
+                 "mips %u, array %u, samples %u/%u, subresource %u; destination %ux%u format %#x, "
+                 "usage %u, bind %#x, cpu %#x, misc %#x, mips %u, array %u, samples %u/%u.\n",
+                 diagnostic_id, src_desc.Width, src_desc.Height, src_desc.Format, src_desc.Usage,
+@@ -4042,7 +3900,7 @@ static HRESULT media_engine_transfer_d3d11(struct media_engine *engine, ID3D11Te
+     ID3D11Texture2D_GetDevice(dst_texture, &dst_device);
+     device_mismatch = src_device != dst_device;
+     if (diagnostic_id && diagnostic_id <= 4)
+-        WARN("Live DXGI transfer %ld uses source device %p and destination device %p; path %s.\n",
++        TRACE("Live DXGI transfer %ld uses source device %p and destination device %p; path %s.\n",
+                 diagnostic_id, src_device, dst_device, device_mismatch ? "cross-device" : "same-device");
+     ID3D11Device_Release(dst_device);
+     ID3D11Device_Release(src_device);
+@@ -4068,23 +3926,8 @@ static HRESULT media_engine_transfer_d3d11(struct media_engine *engine, ID3D11Te
+     }
+ 
+     ID3D11Device_GetImmediateContext(device, &context);
+-    if (diagnostic_id && diagnostic_id <= 4)
+-        media_engine_diagnose_live_texture_pixels(device, context, src_texture, subresource,
+-                &src_desc, &src_box, diagnostic_id, "source");
+     ID3D11DeviceContext_CopySubresourceRegion(context, (ID3D11Resource *)dst_texture, 0,
+             dst_rect->left, dst_rect->top, 0, (ID3D11Resource *)src_texture, subresource, &src_box);
+-    if (diagnostic_id && diagnostic_id <= 4)
+-    {
+-        dst_box.left = dst_rect->left;
+-        dst_box.top = dst_rect->top;
+-        dst_box.front = 0;
+-        dst_box.right = dst_rect->left + src_box.right - src_box.left;
+-        dst_box.bottom = dst_rect->top + src_box.bottom - src_box.top;
+-        dst_box.back = 1;
+-        media_engine_diagnose_live_texture_pixels(device, context, dst_texture, 0,
+-                &dst_desc, &dst_box, diagnostic_id, "destination");
+-        WARN("Live DXGI transfer %ld queued the same-device copy through device %p.\n", diagnostic_id, device);
+-    }
+     ID3D11DeviceContext_Release(context);
+ 
+     media_engine_unlock_d3d_device(engine, device);
+@@ -4097,19 +3940,16 @@ static HRESULT media_engine_transfer_to_d3d11_texture(struct media_engine *engin
+         const MFVideoNormalizedRect *src_rect, const RECT *dst_rect, const MFARGB *color)
+ {
+     static const float black[] = {0.0f, 0.0f, 0.0f, 0.0f};
+-    static LONG live_render_transfer_count;
+     ID3D11Device *device, *dst_device;
+     ID3D11DeviceContext *context;
+     ID3D11RenderTargetView *rtv;
+     unsigned int stride, offset;
+     D3D11_TEXTURE2D_DESC desc;
+-    D3D11_BOX diagnostic_box = {0};
+     BOOL device_mismatch;
+     struct vec3 quad[4];
+     D3D11_VIEWPORT vp;
+     struct rect src, dst;
+     struct color backcolor;
+-    LONG diagnostic_id = 0;
+     HRESULT hr;
+     RECT rect;
+ 
+@@ -4134,8 +3974,6 @@ static HRESULT media_engine_transfer_to_d3d11_texture(struct media_engine *engin
+     }
+ 
+     ID3D11Texture2D_GetDesc(texture, &desc);
+-    if (isinf(engine->duration))
+-        diagnostic_id = InterlockedIncrement(&live_render_transfer_count);
+ 
+     if (FAILED(hr = ID3D11Device_CreateRenderTargetView(device, (ID3D11Resource *)texture, NULL, &rtv)))
+     {
+@@ -4239,15 +4077,6 @@ static HRESULT media_engine_transfer_to_d3d11_texture(struct media_engine *engin
+ 
+     ID3D11DeviceContext_Draw(context, 4, 0);
+ 
+-    if (diagnostic_id && diagnostic_id <= 4)
+-    {
+-        diagnostic_box.right = desc.Width;
+-        diagnostic_box.bottom = desc.Height;
+-        diagnostic_box.back = 1;
+-        media_engine_diagnose_live_texture_pixels(device, context, texture, 0,
+-                &desc, &diagnostic_box, diagnostic_id, "render destination");
+-    }
+-
+     ID3D11RenderTargetView_Release(rtv);
+     ID3D11DeviceContext_Release(context);
+ 
+@@ -4375,10 +4204,7 @@ static HRESULT WINAPI media_engine_TransferVideoFrame(IMFMediaEngineEx *iface, I
+         const MFVideoNormalizedRect *src_rect, const RECT *dst_rect, const MFARGB *color)
+ {
+     struct media_engine *engine = impl_from_IMFMediaEngineEx(iface);
+-    static LONG finite_client_texture_count;
+-    static LONG live_client_texture_count;
+     static LONG live_transfer_count;
+-    D3D11_TEXTURE2D_DESC desc;
+     ID3D11Texture2D *texture;
+     HRESULT hr = E_NOINTERFACE;
+     IWICBitmap *bitmap;
+@@ -4391,32 +4217,6 @@ static HRESULT WINAPI media_engine_TransferVideoFrame(IMFMediaEngineEx *iface, I
+ 
+     if (SUCCEEDED(IUnknown_QueryInterface(surface, &IID_ID3D11Texture2D, (void **)&texture)))
+     {
+-        LONG count;
+-
+-        ID3D11Texture2D_GetDesc(texture, &desc);
+-        if (isinf(engine->duration))
+-            count = InterlockedIncrement(&live_client_texture_count);
+-        else
+-            count = InterlockedIncrement(&finite_client_texture_count);
+-
+-        if (count <= 8)
+-        {
+-            ID3D11Device *device;
+-
+-            ID3D11Texture2D_GetDevice(texture, &device);
+-            WARN("%s client texture %ld: engine %p, source %s, texture %p, device %p, "
+-                    "%ux%u format %#x, usage %u, bind %#x, cpu %#x, misc %#x, "
+-                    "mips %u, array %u, samples %u/%u, frame %ldx%ld, destination %s.\n",
+-                    isinf(engine->duration) ? "Live" : "Finite", count, engine,
+-                    debugstr_w(engine->current_source), texture, device,
+-                    desc.Width, desc.Height, desc.Format, desc.Usage, desc.BindFlags,
+-                    desc.CPUAccessFlags, desc.MiscFlags, desc.MipLevels, desc.ArraySize,
+-                    desc.SampleDesc.Count, desc.SampleDesc.Quality,
+-                    engine->video_frame.size.cx, engine->video_frame.size.cy,
+-                    wine_dbgstr_rect(dst_rect));
+-            ID3D11Device_Release(device);
+-        }
+-
+         if (!engine->device_manager
+                 || engine->video_frame.format_mismatch
+                 || FAILED(hr = media_engine_transfer_d3d11(engine, texture, src_rect, dst_rect, color)))
+@@ -4439,7 +4239,7 @@ static HRESULT WINAPI media_engine_TransferVideoFrame(IMFMediaEngineEx *iface, I
+         LONG count = InterlockedIncrement(&live_transfer_count);
+ 
+         if (count <= 16 || !(count % 120) || FAILED(hr))
+-            WARN("Live frame transfer %ld: hr %#lx, pts %s, flags %#x.\n", count, hr,
++            TRACE("Live frame transfer %ld: hr %#lx, pts %s, flags %#x.\n", count, hr,
+                     wine_dbgstr_longlong(engine->video_frame.pts), engine->flags);
+     }
+ 
+@@ -4522,7 +4322,7 @@ static HRESULT WINAPI media_engine_OnVideoStreamTick(IMFMediaEngineEx *iface, LO
+         LONG count = InterlockedIncrement(&live_tick_count);
+ 
+         if (count <= 16 || !(count % 120) || FAILED(hr))
+-            WARN("Live video tick %ld: hr %#lx, pts %s, clock %s, flags %#x.\n", count, hr,
++            TRACE("Live video tick %ld: hr %#lx, pts %s, clock %s, flags %#x.\n", count, hr,
+                     pts && (hr == S_OK || hr == S_FALSE) ? wine_dbgstr_longlong(*pts) : "(unset)",
+                     clocktime != MINLONGLONG ? wine_dbgstr_longlong(clocktime) : "(unset)", engine->flags);
+     }
+@@ -4572,7 +4372,7 @@ static HRESULT WINAPI media_engine_GetStatistics(IMFMediaEngineEx *iface, MF_MED
+         LONG count = InterlockedIncrement(&live_statistics_count);
+ 
+         if (count <= 32 || !(count % 120))
+-            WARN("Live statistics call %ld: id %u, hr %#lx, output %p, flags %#x.\n",
++            TRACE("Live statistics call %ld: id %u, hr %#lx, output %p, flags %#x.\n",
+                     count, stat_id, E_NOTIMPL, stat, flags);
+     }
+ 
+@@ -4647,7 +4447,7 @@ static HRESULT WINAPI media_engine_GetResourceCharacteristics(IMFMediaEngineEx *
+         LONG count = InterlockedIncrement(&live_characteristics_count);
+ 
+         if (count <= 16 || !(count % 120) || FAILED(hr))
+-            WARN("Live resource-characteristics call %ld: hr %#lx, value %#lx, flags %#x.\n",
++            TRACE("Live resource-characteristics call %ld: hr %#lx, value %#lx, flags %#x.\n",
+                     count, hr, SUCCEEDED(hr) && flags ? *flags : 0, engine_flags);
+     }
+ 
+@@ -4679,7 +4479,7 @@ static HRESULT WINAPI media_engine_GetPresentationAttribute(IMFMediaEngineEx *if
+         LONG count = InterlockedIncrement(&live_presentation_attribute_count);
+ 
+         if (count <= 32 || !(count % 120) || FAILED(hr))
+-            WARN("Live presentation-attribute call %ld: %s, hr %#lx, vt %u, flags %#x.\n",
++            TRACE("Live presentation-attribute call %ld: %s, hr %#lx, vt %u, flags %#x.\n",
+                     count, debugstr_guid(attribute), hr, SUCCEEDED(hr) && value ? value->vt : VT_EMPTY, flags);
+     }
+ 
+@@ -4741,7 +4541,7 @@ static HRESULT WINAPI media_engine_GetStreamAttribute(IMFMediaEngineEx *iface, D
+         }
+     }
+     if (isinf(engine->duration))
+-        WARN("Live stream attribute: stream %lu, attribute %s, hr %#lx, vt %u.\n", stream_index,
++        TRACE("Live stream attribute: stream %lu, attribute %s, hr %#lx, vt %u.\n", stream_index,
+                 debugstr_guid(attribute), hr, SUCCEEDED(hr) && value ? value->vt : VT_EMPTY);
+     LeaveCriticalSection(&engine->cs);
+ 
+@@ -4776,7 +4576,7 @@ static HRESULT WINAPI media_engine_GetStreamSelection(IMFMediaEngineEx *iface, D
+         }
+     }
+     if (isinf(engine->duration))
+-        WARN("Live stream selection: stream %lu, selected %u, hr %#lx.\n",
++        TRACE("Live stream selection: stream %lu, selected %u, hr %#lx.\n",
+                 stream_index, *enabled, hr);
+     LeaveCriticalSection(&engine->cs);
+ 
+diff --git a/dlls/winedmo/unix_demuxer.c b/dlls/winedmo/unix_demuxer.c
+index 8913dec91d358445dcce019022fe9a1e57d9a9e9..9585fea782166ab958b4019b7995460497829da5 100644
+--- a/dlls/winedmo/unix_demuxer.c
++++ b/dlls/winedmo/unix_demuxer.c
+@@ -1141,7 +1141,7 @@ NTSTATUS demuxer_create( void *arg )
+     }
+     else
+     {
+-        FIXME( "Unknown MIME type for format %s, url %s\n", debugstr_a(format->name), debugstr_a(params->url) );
++        FIXME( "Unknown MIME type for format %s (remote URL omitted)\n", debugstr_a(format->name) );
+         strcpy( params->mime_type, "video/x-application" );
+     }
+ 
+-- 
+RTSP-on-GE A3.19

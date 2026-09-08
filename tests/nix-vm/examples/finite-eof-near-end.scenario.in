@@ -1,0 +1,15 @@
+# SPDX-License-Identifier: BSD-3-Clause
+# Seek close to, but not exactly at, the known finite duration. The successful
+# seek must complete and the next ordinary reads must own a normal ENDED event.
+load "http://127.0.0.1:18765/media?case=finite-eof-near-end"
+wait_event CANPLAY 15000
+play
+wait_event PLAYING 5000
+wait_time @STARTUP_WAIT@ 5000
+wait_time @INITIAL_WAIT@ 20000
+snapshot "pre-eof-steady"
+seek @EOF_SEEK@
+wait_event SEEKED 10000
+wait_event ENDED 15000
+snapshot "finite-eof-ended"
+shutdown

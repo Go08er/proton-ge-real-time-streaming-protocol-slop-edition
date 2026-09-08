@@ -1,0 +1,2682 @@
+{
+  "fixtures": [
+    {
+      "availability": "implemented",
+      "id": "vod-primary",
+      "identity": [
+        "full profile: 120.000 seconds, 1280x720, 30/1 fps, yuv420p, 48 kHz stereo; smoke profile is an explicitly smaller diagnostic member",
+        "H.264 Main profile with AAC-LC stereo; closed GOP every 30 frames, no scene-cut keyframes, fast-start MP4",
+        "video carries a visible frame/time code; both audio channels have continuous carriers plus nonrepeating one-second frequency markers",
+        "the Nix fixture derivation records FFmpeg closure identity, command, byte size, ffprobe JSON hash, and SHA-256"
+      ],
+      "kind": "generated-file",
+      "oracles": [
+        "frame PTS and visual code identify presentation time within one frame",
+        "decoded PCM carrier energy, marker identity, and sample count identify audio time within 40 ms",
+        "expected duration is the selected profile: 120.000 seconds for full or 8.000 seconds for smoke"
+      ],
+      "topology": [
+        "one H.264 video stream",
+        "one AAC-LC stereo stream"
+      ]
+    },
+    {
+      "availability": "implemented",
+      "id": "vod-tail-moov",
+      "identity": [
+        "byte-identical encoded tracks to vod-primary remuxed with MP4 metadata at the end",
+        "the generated artifact is hash-locked by the fixture derivation"
+      ],
+      "kind": "generated-file",
+      "oracles": [
+        "same decoded timeline as vod-primary",
+        "progressive startup is not required before MP4 metadata becomes available"
+      ],
+      "topology": [
+        "same elementary streams as vod-primary"
+      ]
+    },
+    {
+      "availability": "implemented",
+      "id": "vod-fragmented",
+      "identity": [
+        "fragmented MP4 covering the same selected-profile duration as vod-primary",
+        "two-second fragments with deterministic keyframe alignment"
+      ],
+      "kind": "generated-file",
+      "oracles": [
+        "continuous PTS across every fragment",
+        "audio/video skew stays within 150 ms"
+      ],
+      "topology": [
+        "H.264 video",
+        "AAC-LC stereo"
+      ]
+    },
+    {
+      "availability": "implemented",
+      "id": "container-matrix",
+      "identity": [
+        "same-track H.264/AAC subsets remuxed as MP4, MOV, MKV, and MPEG-TS",
+        "format-native WebM, AVI, and ASF pairs live in codec-matrix so container and codec outcomes are never conflated"
+      ],
+      "kind": "derived-set",
+      "oracles": [
+        "member identity is selected explicitly",
+        "decoded time code matches the source timeline"
+      ],
+      "topology": [
+        "one video stream",
+        "one stereo audio stream"
+      ]
+    },
+    {
+      "availability": "implemented",
+      "id": "codec-matrix",
+      "identity": [
+        "selected-profile subsets: H.264/AAC, HEVC/AAC, VP8/Vorbis, VP9/Opus, MPEG-4 Part 2/MP3, WMV2/WMAV2, and AV1/Opus",
+        "one variable changes per member; container choice is recorded separately"
+      ],
+      "kind": "derived-set",
+      "oracles": [
+        "reference outcome is recorded per member",
+        "a failure is bounded and names unsupported media rather than hanging"
+      ],
+      "topology": [
+        "one video stream",
+        "one stereo audio stream"
+      ]
+    },
+    {
+      "availability": "implemented",
+      "id": "audio-format-matrix",
+      "identity": [
+        "selected-profile stereo members for MP3, ADTS AAC, WAV PCM S16LE, FLAC, and Vorbis at 44.1 and 48 kHz; Opus at its native 48 kHz",
+        "the same discovery family also supplies deterministic AAC 5.1 and a two-AAC-track selection input"
+      ],
+      "kind": "derived-set",
+      "oracles": [
+        "nonzero PCM reaches the player",
+        "sample count, channel count, and channel energy match the fixture manifest"
+      ],
+      "topology": [
+        "audio only"
+      ]
+    },
+    {
+      "availability": "planned",
+      "id": "media-edge-matrix",
+      "identity": [
+        "planned deterministic members: mono AAC/MP3; variable-frame-rate and nonzero-start MP4; harmless subtitle, data, and cover-art streams",
+        "planned H.264 Baseline/Main/High profile plus level/resolution/frame-rate boundaries and declared midstream audio/video format changes",
+        "every member will have a separate packet/probe hash and a frozen stock-GE/Proton-RTSP reference outcome"
+      ],
+      "kind": "derived-set",
+      "oracles": [
+        "the intended primary audio/video tracks remain selected",
+        "presentation follows declared PTS without hangs or silent topology loss",
+        "unsupported boundaries fail once and do not contaminate the next required-success source"
+      ],
+      "topology": [
+        "single-track and auxiliary-track finite media",
+        "fixed and changing audio/video format members"
+      ]
+    },
+    {
+      "availability": "implemented",
+      "id": "topology-audio-only",
+      "identity": [
+        "selected topology-duration M4A using the primary audio marker timeline: 60.000 seconds full or 6.000 seconds smoke"
+      ],
+      "kind": "generated-file",
+      "oracles": [
+        "audio starts without waiting for video",
+        "no video stream is fabricated"
+      ],
+      "topology": [
+        "one AAC-LC stereo stream",
+        "no video stream"
+      ]
+    },
+    {
+      "availability": "implemented",
+      "id": "topology-video-only",
+      "identity": [
+        "selected topology-duration fast-start MP4 using the primary visual timeline: 60.000 seconds full or 6.000 seconds smoke"
+      ],
+      "kind": "generated-file",
+      "oracles": [
+        "video advances without waiting for audio",
+        "no audio topology is required"
+      ],
+      "topology": [
+        "one H.264 video stream",
+        "no audio stream"
+      ]
+    },
+    {
+      "availability": "implemented",
+      "id": "topology-delayed-audio",
+      "identity": [
+        "full-profile 60.000-second MP4 member with the same encoded tracks; smoke uses its declared shorter duration"
+      ],
+      "kind": "generated-file",
+      "oracles": [
+        "video advances before first audio",
+        "audio joins at the selected delay (3.000 seconds full or 1.500 seconds smoke) without timeline reset"
+      ],
+      "topology": [
+        "video begins at 0.000 seconds",
+        "audio first PTS is 3.000 seconds full or 1.500 seconds smoke"
+      ]
+    },
+    {
+      "availability": "implemented",
+      "id": "topology-delayed-video",
+      "identity": [
+        "full-profile 60.000-second MP4 member with the same encoded tracks; smoke uses its declared shorter duration"
+      ],
+      "kind": "generated-file",
+      "oracles": [
+        "audio advances before first video",
+        "video joins at the selected delay (3.000 seconds full or 1.500 seconds smoke) without restarting audio"
+      ],
+      "topology": [
+        "audio begins at 0.000 seconds",
+        "video first PTS is 3.000 seconds full or 1.500 seconds smoke"
+      ]
+    },
+    {
+      "availability": "planned",
+      "id": "topology-gap-audio",
+      "identity": [
+        "planned full-profile MPEG-TS member with timestamp continuity after the gap; no generated artifact exists yet"
+      ],
+      "kind": "generated-file",
+      "oracles": [
+        "video remains live through the gap",
+        "audio resumes after the gap without permanent starvation"
+      ],
+      "topology": [
+        "continuous video",
+        "audio packets absent from 20.000 through 25.000 seconds"
+      ]
+    },
+    {
+      "availability": "planned",
+      "id": "topology-gap-video",
+      "identity": [
+        "planned full-profile MPEG-TS member with timestamp continuity after the gap; no generated artifact exists yet"
+      ],
+      "kind": "generated-file",
+      "oracles": [
+        "audio remains continuous through the gap",
+        "video resumes without rebasing audio"
+      ],
+      "topology": [
+        "continuous audio",
+        "video packets absent from 20.000 through 25.000 seconds"
+      ]
+    },
+    {
+      "availability": "implemented",
+      "id": "topology-multichannel",
+      "identity": [
+        "audio-only AAC M4A at the selected matrix duration (20.000 seconds full or 4.000 seconds smoke); each of six channels has a unique deterministic tone"
+      ],
+      "kind": "generated-file",
+      "oracles": [
+        "six channels are reported",
+        "no channel is silent, duplicated, or reordered relative to the manifest"
+      ],
+      "topology": [
+        "AAC 5.1 audio"
+      ]
+    },
+    {
+      "availability": "implemented",
+      "id": "topology-multitrack",
+      "identity": [
+        "H.264 MP4 at the selected matrix duration (20.000 seconds full or 4.000 seconds smoke) with exactly one default AAC track and one alternate AAC track"
+      ],
+      "kind": "generated-file",
+      "oracles": [
+        "the same intended track is selected on every load",
+        "the unselected track never leaks into output"
+      ],
+      "topology": [
+        "one H.264 video stream",
+        "two AAC stereo tracks with distinct tones and language tags"
+      ]
+    },
+    {
+      "availability": "implemented",
+      "id": "hls-vod-set",
+      "identity": [
+        "full-profile finite 30.000-second HLS with two-second segments, relative children, and ENDLIST",
+        "generated members are clear muxed MPEG-TS, a separate audio/video master, and CMAF/fMP4; redirect is composable, while AES-128 and discontinuity fixtures remain planned"
+      ],
+      "kind": "derived-set",
+      "oracles": [
+        "segment sequence and hashes are fixed",
+        "finite duration and seek target map to known segments"
+      ],
+      "topology": [
+        "H.264 video",
+        "AAC stereo"
+      ]
+    },
+    {
+      "availability": "implemented",
+      "id": "hls-live-set",
+      "identity": [
+        "immutable inputs for a loopback sliding playlist with seven two-second segments in the full profile and no ENDLIST",
+        "the bounded literal-loopback publisher serves muxed and atomically paired audio/video windows with normal, hold, delayed-audio, audio-404, and audio-503 modes; discontinuity injection remains planned"
+      ],
+      "kind": "service",
+      "oracles": [
+        "MEDIA-SEQUENCE advances",
+        "live-edge lag and audio/video skew are measurable from the encoded markers"
+      ],
+      "topology": [
+        "continuous H.264 video",
+        "continuous AAC stereo"
+      ]
+    },
+    {
+      "availability": "planned",
+      "id": "dash-vod-set",
+      "identity": [
+        "planned deterministic MPEG-DASH MPD with H.264/AAC initialization and media segments derived from vod-primary",
+        "static finite presentation plus a bounded representation-switch member; no public CDN or DRM"
+      ],
+      "kind": "derived-set",
+      "oracles": [
+        "stock GE, frozen Proton-RTSP, and candidate outcomes are recorded independently",
+        "supported playback starts before every segment is transferred and seeks to the declared segment",
+        "unsupported playback fails once without a retry storm or contaminating the next source"
+      ],
+      "topology": [
+        "H.264 video representation",
+        "AAC stereo representation"
+      ]
+    },
+    {
+      "availability": "planned",
+      "id": "smooth-vod-set",
+      "identity": [
+        "planned deterministic Microsoft Smooth Streaming manifest and fragmented H.264/AAC members",
+        "finite loopback-only reference input with no DRM"
+      ],
+      "kind": "derived-set",
+      "oracles": [
+        "reference outcome is recorded before any project change",
+        "supported playback and seeking preserve one A/V timeline",
+        "unsupported playback terminates cleanly and the next MP4 source succeeds"
+      ],
+      "topology": [
+        "fragmented H.264 video",
+        "fragmented AAC stereo"
+      ]
+    },
+    {
+      "availability": "planned",
+      "id": "rtmp-live-set",
+      "identity": [
+        "planned VM-private RTMP server and deterministic H.264/AAC publication",
+        "the result is reference discovery because AVPro documents Windows RTMP through suitable DirectShow support rather than as a universal Media Foundation route"
+      ],
+      "kind": "service",
+      "oracles": [
+        "reference and candidate support classification match",
+        "a supported stream maintains advancing nonzero audio and video",
+        "an unsupported route fails within a bounded deadline and leaves no worker"
+      ],
+      "topology": [
+        "continuous H.264 video",
+        "continuous AAC stereo"
+      ]
+    },
+    {
+      "availability": "implemented",
+      "id": "rtsp-live-set",
+      "identity": [
+        "loopback MediaMTX publication from the hash-locked marker fixtures",
+        "TCP interleaving is the mandatory baseline; UDP and HTTP-tunnel forms are separate VM/reference discovery members"
+      ],
+      "kind": "service",
+      "oracles": [
+        "track discovery matches the selected member",
+        "live source is reported nonseekable",
+        "marker time continues monotonically"
+      ],
+      "topology": [
+        "H.264/AAC A/V",
+        "H.264 video-only member",
+        "AAC audio-only member"
+      ]
+    },
+    {
+      "availability": "planned",
+      "id": "icy-radio-live",
+      "identity": [
+        "loopback HTTP ICY stream with deterministic metadata intervals and audio markers"
+      ],
+      "kind": "service",
+      "oracles": [
+        "metadata bytes never enter decoded PCM",
+        "audio continues across metadata blocks"
+      ],
+      "topology": [
+        "MP3 live audio",
+        "AAC live audio"
+      ]
+    },
+    {
+      "availability": "implemented",
+      "id": "http-fault-service",
+      "identity": [
+        "implemented bounded modes: Range, no-Range, fixed redirect, selected fail-first status, post-open Range failure, truncate, chunked, delayed header, throttled body, and stall/resume",
+        "invalid Content-Range, redirect loop, explicit FIN/reset, and per-client network faults remain VM compositions; every implemented mode has request/concurrency/log budgets and a privacy-minimized event log"
+      ],
+      "kind": "service",
+      "oracles": [
+        "request count/status/range/body timing",
+        "bounded terminal error or documented recovery",
+        "no outbound request"
+      ],
+      "topology": [
+        "serves vod-primary or HLS children"
+      ]
+    },
+    {
+      "availability": "planned",
+      "id": "rtsp-fault-service",
+      "identity": [
+        "VM-only two-node service profiles for absent endpoint, accepted-silent control connection, server stop, packet loss, jitter, duplication, and reordering",
+        "no fault rule is installed on the host"
+      ],
+      "kind": "service",
+      "oracles": [
+        "operation deadline or cancellation time",
+        "packet and reconnect timeline",
+        "no surviving consumer worker"
+      ],
+      "topology": [
+        "RTSP control and RTP media faults around rtsp-live-set"
+      ]
+    },
+    {
+      "availability": "compose",
+      "id": "tls-media-set",
+      "identity": [
+        "ephemeral VM-only CA plus valid, self-signed, expired, and hostname-mismatch leaves",
+        "fixed HTTPS-to-HTTP redirect and mixed-origin HLS children"
+      ],
+      "kind": "service",
+      "oracles": [
+        "valid trust succeeds",
+        "invalid trust fails before media decode",
+        "downgrade and nested-protocol policy are explicit"
+      ],
+      "topology": [
+        "HTTPS MP4 and HLS members"
+      ]
+    },
+    {
+      "availability": "compose",
+      "id": "malformed-media-set",
+      "identity": [
+        "generated minimum: zero-byte, deterministic non-media, two fixed truncations, missing-child HLS, and malformed HLS",
+        "header-only, invalid extradata, nonmonotonic timestamp, oversized dimension declaration, and unsupported-codec members remain planned; every implemented byte is generated locally and hash-locked"
+      ],
+      "kind": "invalid",
+      "oracles": [
+        "one bounded error",
+        "no crash, hang, retry storm, or later-source contamination"
+      ],
+      "topology": [
+        "invalid container and elementary-stream members"
+      ]
+    },
+    {
+      "availability": "planned",
+      "id": "yt-dlp-stub",
+      "identity": [
+        "local Windows stub named yt-dlp.exe records argv and inherited standard-handle classes, emits one fixed loopback URL, then exits with a selected code",
+        "success, timeout, malformed output, and nonzero exit are deterministic members"
+      ],
+      "kind": "service",
+      "oracles": [
+        "argument vector preserved byte-for-byte",
+        "optional path replacement is scoped",
+        "no surviving child process"
+      ],
+      "topology": [
+        "process-resolution control; no decoder"
+      ]
+    }
+  ],
+  "profiles": {
+    "base": {
+      "purpose": [
+        "Required foundation behavior: preserve stock GE while making ordinary VOD incremental, seekable when truthful, and stable across HLS and basic RTSP live playback.",
+        "Every base failure blocks promotion of the extended parity branch."
+      ]
+    },
+    "discovery": {
+      "purpose": [
+        "Codec, container, resolution, and frontend probes whose expected result is learned from stock GE and frozen Proton-RTSP 11 before any patch is admitted.",
+        "Discovery does not create a public support claim by itself."
+      ]
+    },
+    "parity": {
+      "purpose": [
+        "Extended behavior compared case-for-case with frozen Proton-RTSP 11, while retaining every base and stock-GE preservation gate.",
+        "A historical registration that fails in the frozen reference is documented rather than copied as a defect."
+      ]
+    }
+  },
+  "scenarios": [
+    {
+      "actions": [
+        "run existing HTTP fixture unit tests",
+        "run native RTSP and HLS smoke probes"
+      ],
+      "fixtures": [
+        "vod-primary",
+        "hls-vod-set",
+        "hls-live-set",
+        "rtsp-live-set",
+        "http-fault-service"
+      ],
+      "id": "native-fixture-contracts",
+      "isolation": "host-loopback",
+      "layer": "native-loopback",
+      "negative_controls": [
+        "probe an absent loopback endpoint",
+        "send an unsatisfiable byte range"
+      ],
+      "oracles": [
+        "fixtures expose the declared tracks and request behavior",
+        "listeners and publishers are gone after cleanup"
+      ],
+      "profiles": [
+        "base",
+        "parity"
+      ],
+      "status": "compose",
+      "timeout_s": 180
+    },
+    {
+      "actions": [
+        "Play",
+        "Pause during initial scrub",
+        "wait through nonzero RateChanged completion"
+      ],
+      "fixtures": [
+        "vod-primary"
+      ],
+      "id": "pause-scrub-compiled-control",
+      "isolation": "vm-only",
+      "layer": "proton-probe",
+      "negative_controls": [
+        "A3.7 must reproduce the stale-Play failure",
+        "setup or loader failure is not a valid negative control"
+      ],
+      "oracles": [
+        "latest Pause wins",
+        "clock remains stationary",
+        "presentation does not reach ENDED behind Pause"
+      ],
+      "profiles": [
+        "base",
+        "parity"
+      ],
+      "status": "compose",
+      "timeout_s": 45
+    },
+    {
+      "actions": [
+        "serve at 1024 KiB/s with Range",
+        "open and play from zero"
+      ],
+      "fixtures": [
+        "vod-primary",
+        "http-fault-service"
+      ],
+      "id": "progressive-start-range",
+      "isolation": "vm-only",
+      "layer": "proton-probe",
+      "negative_controls": [
+        "stock GE ordinary HTTP is the download-first comparison",
+        "vod-tail-moov distinguishes container layout from backend caching"
+      ],
+      "oracles": [
+        "first advancing audio and video arrive within 5 seconds",
+        "first sample precedes final response byte by at least 10 seconds",
+        "ordinary success does not use URLMon fallback"
+      ],
+      "profiles": [
+        "base",
+        "parity"
+      ],
+      "status": "compose",
+      "timeout_s": 150
+    },
+    {
+      "actions": [
+        "serve no-Range at 1024 KiB/s",
+        "play sequentially",
+        "request a nonzero seek",
+        "hold for bounded wall-clock time before scoring recovery"
+      ],
+      "fixtures": [
+        "vod-primary",
+        "http-fault-service"
+      ],
+      "id": "progressive-no-range",
+      "isolation": "vm-only",
+      "layer": "proton-probe",
+      "negative_controls": [
+        "the Range member must advertise and perform seeking",
+        "an ignored Range cannot be scored as a seek pass"
+      ],
+      "oracles": [
+        "startup remains progressive",
+        "source does not claim reliable random seeking",
+        "rejected seek does not poison continuing sequential playback"
+      ],
+      "profiles": [
+        "base",
+        "parity"
+      ],
+      "status": "compose",
+      "timeout_s": 150
+    },
+    {
+      "actions": [
+        "open a fixed 307 route",
+        "play",
+        "seek to 70 seconds"
+      ],
+      "fixtures": [
+        "vod-primary",
+        "http-fault-service"
+      ],
+      "id": "progressive-fixed-redirect",
+      "isolation": "vm-only",
+      "layer": "proton-probe",
+      "negative_controls": [
+        "redirect loop terminates with one bounded error",
+        "direct nonredirect member must retain identical media timing"
+      ],
+      "oracles": [
+        "redirect target remains progressive",
+        "seek receives 206 and resumes within 3 seconds",
+        "no duplicate full transfer"
+      ],
+      "profiles": [
+        "base",
+        "parity"
+      ],
+      "status": "compose",
+      "timeout_s": 150
+    },
+    {
+      "actions": [
+        "begin source load",
+        "before ready request time 47.250",
+        "Play exactly once"
+      ],
+      "fixtures": [
+        "vod-primary",
+        "http-fault-service"
+      ],
+      "id": "join-at-offset",
+      "isolation": "vm-only",
+      "layer": "proton-probe",
+      "negative_controls": [
+        "load without an offset must begin at zero",
+        "A3.7 pause-scrub control remains a separate expected failure"
+      ],
+      "oracles": [
+        "first stable presentation is 47.250 plus or minus 1.250 seconds",
+        "both streams share one generation and clock",
+        "no decoded sample from the zero-time epoch appears after target playback begins"
+      ],
+      "profiles": [
+        "base",
+        "parity"
+      ],
+      "status": "compose",
+      "timeout_s": 45
+    },
+    {
+      "actions": [
+        "after 10 seconds issue 301 SetCurrentTimeEx calls over 3 seconds from 10.000 through 83.250",
+        "release at 83.250"
+      ],
+      "fixtures": [
+        "vod-primary",
+        "http-fault-service"
+      ],
+      "id": "aggressive-seek-latest-wins",
+      "isolation": "vm-only",
+      "layer": "proton-probe",
+      "negative_controls": [
+        "A3.1 seek storm trace demonstrates the forbidden uncoalesced behavior",
+        "one ordinary seek proves the fixture itself is seekable"
+      ],
+      "oracles": [
+        "final stable time is within one GOP plus 250 ms of 83.250",
+        "resume within 3 seconds",
+        "backend performs at most five real seeks",
+        "audio and video recover from the same final epoch"
+      ],
+      "profiles": [
+        "base",
+        "parity"
+      ],
+      "status": "compose",
+      "timeout_s": 45
+    },
+    {
+      "actions": [
+        "alternate 5.000 and 105.000 at 20 Hz for 4 seconds",
+        "end at 37.500"
+      ],
+      "fixtures": [
+        "vod-primary",
+        "http-fault-service"
+      ],
+      "id": "alternating-seek-generation",
+      "isolation": "vm-only",
+      "layer": "proton-probe",
+      "negative_controls": [
+        "single seek to 37.500 must pass",
+        "removing generation checks in the model must expose stale completion"
+      ],
+      "oracles": [
+        "37.500 is the only final presentation",
+        "old packets, EOS, and seek completions cannot cross the final generation",
+        "no same-stream request reordering"
+      ],
+      "profiles": [
+        "base",
+        "parity"
+      ],
+      "status": "planned",
+      "timeout_s": 50
+    },
+    {
+      "actions": [
+        "play to 12 seconds",
+        "Pause",
+        "seek to 72.000",
+        "wait 3 seconds",
+        "Play"
+      ],
+      "fixtures": [
+        "vod-primary",
+        "http-fault-service"
+      ],
+      "id": "seek-while-paused",
+      "isolation": "vm-only",
+      "layer": "proton-probe",
+      "negative_controls": [
+        "same seek while running",
+        "working Proton-RTSP reference defines whether a still frame or black surface is expected"
+      ],
+      "oracles": [
+        "state remains paused until final Play",
+        "clock does not advance while paused",
+        "resume begins near 72.000 with both streams",
+        "paused surface appearance is reference-recorded rather than assumed"
+      ],
+      "profiles": [
+        "base",
+        "parity"
+      ],
+      "status": "planned",
+      "timeout_s": 45
+    },
+    {
+      "actions": [
+        "run 100 deterministic Play/Pause schedules around scrub, ready, started, and rate-change events",
+        "end half with Play and half with Pause"
+      ],
+      "fixtures": [
+        "vod-primary"
+      ],
+      "id": "pause-play-race",
+      "isolation": "vm-only",
+      "layer": "proton-probe",
+      "negative_controls": [
+        "A3.7 compiled race must fail its known schedule",
+        "a schedule with no overlapping completion must pass on both builds"
+      ],
+      "oracles": [
+        "latest explicit intent wins every schedule",
+        "Play endpoints advance by the second",
+        "Pause endpoints have stationary clocks",
+        "no stale PLAY_PENDING or PAUSE_PENDING remains"
+      ],
+      "profiles": [
+        "base",
+        "parity"
+      ],
+      "status": "planned",
+      "timeout_s": 180
+    },
+    {
+      "actions": [
+        "play 1.0",
+        "set 0.5, 2.0, 1.0 around pauses and seeks",
+        "attempt unsupported negative and extreme rates"
+      ],
+      "fixtures": [
+        "vod-primary"
+      ],
+      "id": "playback-rate-transitions",
+      "isolation": "vm-only",
+      "layer": "proton-probe",
+      "negative_controls": [
+        "constant 1.0 baseline",
+        "frozen Proton-RTSP reference supplies supported-rate expectations"
+      ],
+      "oracles": [
+        "supported rates change clock slope and preserve A/V",
+        "unsupported rates return a defined error without changing state",
+        "final 1.0 playback recovers"
+      ],
+      "profiles": [
+        "parity",
+        "discovery"
+      ],
+      "status": "planned",
+      "timeout_s": 90
+    },
+    {
+      "actions": [
+        "play a 10-second clipped member to EOS",
+        "repeat with Loop",
+        "disable Loop and reload twice"
+      ],
+      "fixtures": [
+        "vod-primary",
+        "vod-fragmented"
+      ],
+      "id": "eos-loop-reload",
+      "isolation": "vm-only",
+      "layer": "proton-probe",
+      "negative_controls": [
+        "truncated member must error rather than report clean EOS",
+        "video-only and audio-only EOS are tested separately"
+      ],
+      "oracles": [
+        "one EOP/ended event per nonloop generation",
+        "loop restarts both streams once per cycle",
+        "reload never inherits prior EOS"
+      ],
+      "profiles": [
+        "base",
+        "parity"
+      ],
+      "status": "planned",
+      "timeout_s": 90
+    },
+    {
+      "actions": [
+        "start a deliberately slow old load",
+        "replace it with video-only source",
+        "let old resolver finish last"
+      ],
+      "fixtures": [
+        "vod-primary",
+        "topology-video-only",
+        "http-fault-service"
+      ],
+      "id": "source-replacement-generation",
+      "isolation": "vm-only",
+      "layer": "proton-probe",
+      "negative_controls": [
+        "reverse completion order must still select the latest source",
+        "single-source loads verify both fixtures independently"
+      ],
+      "oracles": [
+        "only the new source reaches Ready/Start",
+        "old completion cannot replace topology or emit samples",
+        "old network work is cancelled or drained"
+      ],
+      "profiles": [
+        "base",
+        "parity"
+      ],
+      "status": "compose",
+      "timeout_s": 60
+    },
+    {
+      "actions": [
+        "load and play generation one to steady progressive HTTP playback",
+        "record four wall-clock-spaced A/V checkpoints for generation one",
+        "replace the source while it is running and Play generation two",
+        "record four wall-clock-spaced A/V checkpoints for generation two"
+      ],
+      "fixtures": [
+        "vod-primary",
+        "http-fault-service"
+      ],
+      "id": "running-http-replacement",
+      "isolation": "vm-only",
+      "layer": "proton-probe",
+      "negative_controls": [
+        "generation one must reach steady playback before replacement",
+        "a replacement which becomes ready but never advances must fail"
+      ],
+      "oracles": [
+        "both generations expose simultaneous audio and video",
+        "both generations advance for at least 2.5 seconds across four checkpoints",
+        "the audio-monitor run delivers fresh nonzero decoded PCM in both generations",
+        "no media error, stale event, seek, or timeout is accepted"
+      ],
+      "profiles": [
+        "base",
+        "parity"
+      ],
+      "status": "compose",
+      "timeout_s": 60
+    },
+    {
+      "actions": [
+        "seek first source to 90 seconds",
+        "replace before completion with audio-only source",
+        "Play"
+      ],
+      "fixtures": [
+        "vod-primary",
+        "topology-audio-only",
+        "http-fault-service"
+      ],
+      "id": "replacement-during-seek",
+      "isolation": "vm-only",
+      "layer": "proton-probe",
+      "negative_controls": [
+        "wait for seek completion before replacement",
+        "single audio-only load"
+      ],
+      "oracles": [
+        "new audio begins at its own zero timeline",
+        "old seek completion and packets are discarded",
+        "teardown and next replacement remain responsive"
+      ],
+      "profiles": [
+        "base",
+        "parity"
+      ],
+      "status": "planned",
+      "timeout_s": 60
+    },
+    {
+      "actions": [
+        "request negative, beyond-duration, NaN, positive infinity, and near-overflow times"
+      ],
+      "fixtures": [
+        "vod-primary"
+      ],
+      "id": "invalid-time-inputs",
+      "isolation": "vm-only",
+      "layer": "proton-probe",
+      "negative_controls": [
+        "valid zero and duration-minus-one-second seeks",
+        "model mutation without overflow guards must fail source audit"
+      ],
+      "oracles": [
+        "each call is rejected or clamped consistently with the reference",
+        "no integer overflow, crash, allocation burst, or state corruption",
+        "a later valid seek succeeds"
+      ],
+      "profiles": [
+        "base",
+        "parity",
+        "discovery"
+      ],
+      "status": "planned",
+      "timeout_s": 45
+    },
+    {
+      "actions": [
+        "open",
+        "play",
+        "pause",
+        "seek",
+        "resume",
+        "reach EOS"
+      ],
+      "fixtures": [
+        "topology-audio-only"
+      ],
+      "id": "audio-only-playback",
+      "isolation": "vm-only",
+      "layer": "proton-probe",
+      "negative_controls": [
+        "A/V primary fixture",
+        "audio track removed entirely"
+      ],
+      "oracles": [
+        "PCM remains nonzero and advances",
+        "video absence does not block priming",
+        "events and EOS are one-shot"
+      ],
+      "profiles": [
+        "base",
+        "parity"
+      ],
+      "status": "planned",
+      "timeout_s": 90
+    },
+    {
+      "actions": [
+        "open",
+        "play",
+        "pause",
+        "seek",
+        "resume",
+        "reach EOS"
+      ],
+      "fixtures": [
+        "topology-video-only"
+      ],
+      "id": "video-only-playback",
+      "isolation": "vm-only",
+      "layer": "proton-probe",
+      "negative_controls": [
+        "A/V primary fixture",
+        "video track removed entirely"
+      ],
+      "oracles": [
+        "frames remain available and advance",
+        "audio absence does not block priming",
+        "events and EOS are one-shot"
+      ],
+      "profiles": [
+        "base",
+        "parity"
+      ],
+      "status": "planned",
+      "timeout_s": 90
+    },
+    {
+      "actions": [
+        "play each member from zero",
+        "repeat after a seek before and after the delayed first PTS"
+      ],
+      "fixtures": [
+        "topology-delayed-audio",
+        "topology-delayed-video"
+      ],
+      "id": "asymmetric-track-start",
+      "isolation": "vm-only",
+      "layer": "proton-probe",
+      "negative_controls": [
+        "primary simultaneous-start fixture",
+        "an intentionally absent track distinguishes late from missing"
+      ],
+      "oracles": [
+        "early track is not starved waiting for the late track",
+        "late track joins the shared timeline without restarting the early track"
+      ],
+      "profiles": [
+        "base",
+        "parity"
+      ],
+      "status": "planned",
+      "timeout_s": 150
+    },
+    {
+      "actions": [
+        "play through each five-second packet gap",
+        "pause and resume inside the gap"
+      ],
+      "fixtures": [
+        "topology-gap-audio",
+        "topology-gap-video"
+      ],
+      "id": "asymmetric-track-gap",
+      "isolation": "vm-only",
+      "layer": "proton-probe",
+      "negative_controls": [
+        "primary no-gap fixture",
+        "server-wide stall distinguishes track gap from transport loss"
+      ],
+      "oracles": [
+        "unaffected track continues",
+        "gapped track resumes",
+        "queues remain bounded and no permanent cross-track starvation occurs"
+      ],
+      "profiles": [
+        "base",
+        "parity"
+      ],
+      "status": "planned",
+      "timeout_s": 150
+    },
+    {
+      "actions": [
+        "play and capture PCM before and after seek",
+        "pause and resume"
+      ],
+      "fixtures": [
+        "topology-multichannel"
+      ],
+      "id": "multichannel-audio",
+      "isolation": "vm-only",
+      "layer": "proton-probe",
+      "negative_controls": [
+        "stereo primary fixture",
+        "channel-swap analyzer self-test"
+      ],
+      "oracles": [
+        "six channels remain distinct and ordered",
+        "seek does not collapse or swap channels",
+        "reference and candidate behavior match"
+      ],
+      "profiles": [
+        "parity",
+        "discovery"
+      ],
+      "status": "planned",
+      "timeout_s": 75
+    },
+    {
+      "actions": [
+        "load 20 times",
+        "seek and reload",
+        "replace source and return"
+      ],
+      "fixtures": [
+        "topology-multitrack"
+      ],
+      "id": "multitrack-selection",
+      "isolation": "vm-only",
+      "layer": "proton-probe",
+      "negative_controls": [
+        "single-track primary fixture",
+        "swap the default flag in a separately hashed member"
+      ],
+      "oracles": [
+        "selection is deterministic and matches the reference",
+        "only one audio track reaches PCM",
+        "stream indices remain mapped after reload"
+      ],
+      "profiles": [
+        "parity",
+        "discovery"
+      ],
+      "status": "planned",
+      "timeout_s": 180
+    },
+    {
+      "actions": [
+        "serve MP4 through HTTP/1.1 chunked transfer without Content-Length",
+        "play sequentially",
+        "stop during body transfer"
+      ],
+      "fixtures": [
+        "vod-primary",
+        "http-fault-service"
+      ],
+      "id": "http-chunked-progressive",
+      "isolation": "vm-only",
+      "layer": "proton-probe",
+      "negative_controls": [
+        "Content-Length Range member",
+        "tail-moov member explains expected metadata delay"
+      ],
+      "oracles": [
+        "startup is incremental if container metadata is available",
+        "seekability is not falsely advertised",
+        "cancellation closes the request and worker"
+      ],
+      "profiles": [
+        "parity",
+        "discovery"
+      ],
+      "status": "planned",
+      "timeout_s": 150
+    },
+    {
+      "actions": [
+        "stall the active response for 5 seconds after 12 seconds of media",
+        "resume the same connection"
+      ],
+      "fixtures": [
+        "vod-primary",
+        "http-fault-service"
+      ],
+      "id": "http-stall-resume",
+      "isolation": "vm-only",
+      "layer": "vm-proton",
+      "negative_controls": [
+        "continuous slow-body member",
+        "stall beyond the 15-second I/O deadline must become terminal"
+      ],
+      "oracles": [
+        "buffering is visible or clock stops rather than racing ahead",
+        "playback resumes with A/V sync within 5 seconds",
+        "no second full download"
+      ],
+      "profiles": [
+        "base",
+        "parity"
+      ],
+      "status": "planned",
+      "timeout_s": 90
+    },
+    {
+      "actions": [
+        "truncate at a fixed offset",
+        "repeat with TCP FIN",
+        "repeat with TCP reset"
+      ],
+      "fixtures": [
+        "vod-primary",
+        "http-fault-service"
+      ],
+      "id": "http-truncate-and-reset",
+      "isolation": "vm-only",
+      "layer": "vm-proton",
+      "negative_controls": [
+        "complete response reaches one clean EOS",
+        "native fixture log proves which disconnect occurred"
+      ],
+      "oracles": [
+        "no false clean EOS",
+        "one bounded error reaches the consumer",
+        "next known-good source opens without restarting the prefix"
+      ],
+      "profiles": [
+        "base",
+        "parity"
+      ],
+      "status": "planned",
+      "timeout_s": 90
+    },
+    {
+      "actions": [
+        "start with successful Range open",
+        "return 503 for post-open seek Range",
+        "request one seek"
+      ],
+      "fixtures": [
+        "vod-primary",
+        "http-fault-service"
+      ],
+      "id": "http-failed-range-terminal",
+      "isolation": "vm-only",
+      "layer": "proton-probe",
+      "negative_controls": [
+        "normal Range seek succeeds",
+        "fail-first open exercises the distinct one-shot fallback policy"
+      ],
+      "oracles": [
+        "one terminal Media Foundation error",
+        "no automatic retry loop or fallback full transfer",
+        "shutdown is responsive"
+      ],
+      "profiles": [
+        "base",
+        "parity"
+      ],
+      "status": "compose",
+      "timeout_s": 60
+    },
+    {
+      "actions": [
+        "open fixed 401, 403, 404, 416, 429, 500, and 503 members"
+      ],
+      "fixtures": [
+        "http-fault-service"
+      ],
+      "id": "http-status-budget",
+      "isolation": "vm-only",
+      "layer": "proton-probe",
+      "negative_controls": [
+        "200 member succeeds",
+        "fail-first then success is the only deliberately recovering status case"
+      ],
+      "oracles": [
+        "each status becomes one bounded error",
+        "request count stays within the manifest budget",
+        "no credentials, cookies, or unbounded backoff are invented"
+      ],
+      "profiles": [
+        "base",
+        "parity"
+      ],
+      "status": "planned",
+      "timeout_s": 120
+    },
+    {
+      "actions": [
+        "cancel once during open",
+        "cancel once during blocked read",
+        "cancel once during blocked seek",
+        "replace source immediately after each"
+      ],
+      "fixtures": [
+        "vod-primary",
+        "http-fault-service",
+        "rtsp-fault-service"
+      ],
+      "id": "cancel-open-read-seek",
+      "isolation": "vm-only",
+      "layer": "vm-proton",
+      "negative_controls": [
+        "same operations without cancellation reach their configured deadlines",
+        "immediate cancel before work starts is idempotent"
+      ],
+      "oracles": [
+        "cancellation is observed before worker destruction",
+        "join returns within 5 seconds",
+        "no use-after-free or surviving worker",
+        "replacement source plays"
+      ],
+      "profiles": [
+        "base",
+        "parity"
+      ],
+      "status": "planned",
+      "timeout_s": 180
+    },
+    {
+      "actions": [
+        "play relative-child media playlist",
+        "seek to 17 seconds",
+        "play through ENDLIST",
+        "reload"
+      ],
+      "fixtures": [
+        "hls-vod-set"
+      ],
+      "id": "hls-vod-core",
+      "isolation": "vm-only",
+      "layer": "proton-probe",
+      "negative_controls": [
+        "stock GE same HLS fixture is the preservation control",
+        "missing segment member must not report clean EOS"
+      ],
+      "oracles": [
+        "playlist and segments are fetched incrementally",
+        "seek restarts both streams on the intended segment",
+        "one clean EOS",
+        "GE HLS route never enters URLMon fallback"
+      ],
+      "profiles": [
+        "base",
+        "parity"
+      ],
+      "status": "compose",
+      "timeout_s": 120
+    },
+    {
+      "actions": [
+        "play the fixed AES-128 member",
+        "seek across key/segment boundaries",
+        "reload"
+      ],
+      "fixtures": [
+        "hls-vod-set"
+      ],
+      "id": "hls-aes-128",
+      "isolation": "vm-only",
+      "layer": "proton-probe",
+      "negative_controls": [
+        "wrong key produces bounded decode failure",
+        "clear HLS member verifies transport independently"
+      ],
+      "oracles": [
+        "decrypted A/V matches the clear member",
+        "key fetch remains in the allowed protocol set",
+        "no key bytes enter logs"
+      ],
+      "profiles": [
+        "base",
+        "parity"
+      ],
+      "status": "planned",
+      "timeout_s": 120
+    },
+    {
+      "actions": [
+        "play two-variant master under deterministic bandwidth steps",
+        "cross one EXT-X-DISCONTINUITY",
+        "seek before and after it"
+      ],
+      "fixtures": [
+        "hls-vod-set"
+      ],
+      "id": "hls-variant-and-discontinuity",
+      "isolation": "vm-only",
+      "layer": "proton-probe",
+      "negative_controls": [
+        "single-rendition media playlist",
+        "malformed discontinuity member fails boundedly"
+      ],
+      "oracles": [
+        "selected rendition is recorded",
+        "resolution change does not lose the D3D surface",
+        "timeline and A/V remain continuous after declared discontinuity"
+      ],
+      "profiles": [
+        "parity",
+        "discovery"
+      ],
+      "status": "planned",
+      "timeout_s": 180
+    },
+    {
+      "actions": [
+        "join near live edge",
+        "play 10 minutes",
+        "pause 5 seconds then resume according to reference semantics",
+        "reload"
+      ],
+      "fixtures": [
+        "hls-live-set"
+      ],
+      "id": "hls-live-continuity",
+      "isolation": "vm-only",
+      "layer": "proton-probe",
+      "negative_controls": [
+        "finite HLS VOD exposes duration and seekability",
+        "held playlist must not be mistaken for EOS"
+      ],
+      "oracles": [
+        "audio and video begin without a seek",
+        "source is nonseekable unless a DVR window is explicitly advertised",
+        "live-edge lag does not grow by more than one segment after warmup",
+        "audio/video skew remains within 150 ms"
+      ],
+      "profiles": [
+        "base",
+        "parity"
+      ],
+      "status": "planned",
+      "timeout_s": 900
+    },
+    {
+      "actions": [
+        "delay one segment 3 seconds",
+        "return 404 once",
+        "hold playlist 10 seconds",
+        "resume with a discontinuity and advanced sequence"
+      ],
+      "fixtures": [
+        "hls-live-set"
+      ],
+      "id": "hls-live-segment-faults",
+      "isolation": "vm-only",
+      "layer": "vm-proton",
+      "negative_controls": [
+        "fault-free live member",
+        "permanent segment failure must terminate within the HLS operation deadline plus 5 seconds"
+      ],
+      "oracles": [
+        "retry count is bounded",
+        "temporary loss either recovers like the reference or surfaces one error",
+        "no latency staircase, duplicate audio, or permanent final frame"
+      ],
+      "profiles": [
+        "parity"
+      ],
+      "status": "planned",
+      "timeout_s": 240
+    },
+    {
+      "actions": [
+        "publish the normal auto-advancing muxed live member",
+        "run exact frozen A3.7 as an ordinary healthy qualification",
+        "run exact A3.8 against the identical healthy case and oracle",
+        "sample eight one-second steady checkpoints in each run"
+      ],
+      "fixtures": [
+        "hls-live-set"
+      ],
+      "id": "hls-live-muxed-healthy-ab",
+      "isolation": "vm-only",
+      "layer": "vm-proton",
+      "negative_controls": [
+        "an absent source, unsupported decoder, or setup failure never counts as healthy playback",
+        "the separate-rendition healthy member distinguishes mux-only success",
+        "the fault-free frozen Proton-RTSP 11 reference must satisfy the healthy oracle"
+      ],
+      "oracles": [
+        "both runs bind identical fixture, scenario, driver, parser, and healthy-oracle bytes",
+        "both runs reach CANPLAY and PLAYING with advancing video and clock plus fresh nonzero effect PCM",
+        "both runs require at least three playlist generations, six mux segment GETs, zero HTTP errors, and bounded startup",
+        "both runs require eight unpaused, nonseeking, nonended A/V checkpoints and at least five seconds of same-generation advance"
+      ],
+      "profiles": [
+        "base",
+        "parity"
+      ],
+      "status": "compose",
+      "timeout_s": 180
+    },
+    {
+      "actions": [
+        "publish the normal auto-advancing separate-rendition master",
+        "run exact frozen A3.7 as an ordinary healthy qualification",
+        "run exact A3.8 against the identical healthy case and oracle",
+        "sample eight one-second steady checkpoints in each run"
+      ],
+      "fixtures": [
+        "hls-live-set"
+      ],
+      "id": "hls-live-separate-healthy-ab",
+      "isolation": "vm-only",
+      "layer": "vm-proton",
+      "negative_controls": [
+        "the muxed healthy member distinguishes separate-rendition selection failures",
+        "a missing audio child or setup failure is not healthy playback"
+      ],
+      "oracles": [
+        "both runs bind identical fixture, scenario, driver, parser, and healthy-oracle bytes",
+        "paired audio and video playlist generations advance atomically and both playlists and segment routes are requested during playback",
+        "both runs maintain fresh nonzero audio and video through every healthy checkpoint",
+        "both runs require zero HTTP errors, bounded startup, and bounded teardown"
+      ],
+      "profiles": [
+        "base",
+        "parity"
+      ],
+      "status": "compose",
+      "timeout_s": 180
+    },
+    {
+      "actions": [
+        "first qualify the selected build with the healthy separate-rendition member",
+        "allow exactly two successful audio segment GETs while playlists and video remain available",
+        "return 404 for every later audio segment GET",
+        "sample labelled initial-audio and later-silence phases"
+      ],
+      "fixtures": [
+        "hls-live-set"
+      ],
+      "id": "hls-live-separate-audio-404-oracle-negative",
+      "isolation": "vm-only",
+      "layer": "vm-proton",
+      "negative_controls": [
+        "the normal separate member must pass the healthy oracle",
+        "zero initial decoded audio invalidates the case instead of satisfying its expected failure",
+        "this broken-source stimulus tests oracle sensitivity and is not evidence about A3.7"
+      ],
+      "oracles": [
+        "the initial phase proves fresh nonzero decoded PCM and advancing video before any expected rejection",
+        "fixture evidence proves exactly two successful audio segment requests and continuing video requests",
+        "the later phase fails only the allowlisted audio freshness and nonzero-growth checks while video and clock continue",
+        "the uninstrumented MediaEngine process remains healthy and shuts down within the deadline"
+      ],
+      "profiles": [
+        "base",
+        "parity"
+      ],
+      "status": "compose",
+      "timeout_s": 180
+    },
+    {
+      "actions": [
+        "first qualify the selected build with the healthy separate-rendition member",
+        "allow exactly two successful audio segment GETs while playlists and video remain available",
+        "return 503 for every later audio segment GET",
+        "sample labelled initial-audio and later-silence phases"
+      ],
+      "fixtures": [
+        "hls-live-set"
+      ],
+      "id": "hls-live-separate-audio-503-oracle-negative",
+      "isolation": "vm-only",
+      "layer": "vm-proton",
+      "negative_controls": [
+        "the normal separate member must pass the healthy oracle",
+        "the 404 sibling distinguishes retry policy from permanent absence",
+        "this broken-source stimulus tests oracle sensitivity and is not evidence about A3.7"
+      ],
+      "oracles": [
+        "the initial phase proves fresh nonzero decoded PCM and advancing video before any expected rejection",
+        "fixture evidence proves the exact success budget, bounded retries, and continuing video requests",
+        "the later phase fails only the allowlisted audio freshness and nonzero-growth checks while video and clock continue",
+        "no identical-request storm, worker leak, or unbounded shutdown occurs"
+      ],
+      "profiles": [
+        "base",
+        "parity"
+      ],
+      "status": "compose",
+      "timeout_s": 180
+    },
+    {
+      "actions": [
+        "qualify the selected build with the healthy separate-rendition member",
+        "delay the audio child playlist at one declared publication generation",
+        "keep video available while sampling before, during, and after the delay",
+        "remove the delay and sample at least three recovered checkpoints"
+      ],
+      "fixtures": [
+        "hls-live-set"
+      ],
+      "id": "hls-live-separate-audio-delay-recovery",
+      "isolation": "vm-only",
+      "layer": "vm-proton",
+      "negative_controls": [
+        "the normal member has no declared freshness gap",
+        "a permanent 503 must fail the recovery oracle",
+        "this source-delay case is not evidence about the A3.7 state race"
+      ],
+      "oracles": [
+        "video and presentation time remain live throughout the declared audio delay",
+        "the bounded audio freshness gap begins only after initial fresh nonzero PCM",
+        "new nonzero audio resumes within the delay plus two segment intervals and remains fresh for three checkpoints",
+        "no source replacement, latency staircase, or teardown leak occurs"
+      ],
+      "profiles": [
+        "base",
+        "parity"
+      ],
+      "status": "compose",
+      "timeout_s": 240
+    },
+    {
+      "actions": [
+        "publish one healthy live window and hold its generation",
+        "run beyond the buffered media duration",
+        "sample liveness and terminal state after the window drains",
+        "close the worker within the scenario deadline"
+      ],
+      "fixtures": [
+        "hls-live-set"
+      ],
+      "id": "hls-live-held-window-oracle-negative",
+      "isolation": "vm-only",
+      "layer": "vm-proton",
+      "negative_controls": [
+        "auto-advance with the same immutable segment bytes must pass",
+        "a finite HLS playlist with ENDLIST cannot substitute for the held live source"
+      ],
+      "oracles": [
+        "fixture evidence proves the publication generation never advances",
+        "the liveness oracle detects the drained-window stall and never claims live continuity",
+        "the held playlist is not misreported as clean finite EOS",
+        "the worker and every media process exit within the bounded cleanup deadline"
+      ],
+      "profiles": [
+        "base",
+        "parity"
+      ],
+      "status": "compose",
+      "timeout_s": 180
+    },
+    {
+      "actions": [
+        "play the finite static MPD",
+        "seek to a declared segment boundary",
+        "step the selected representation once",
+        "reload the source"
+      ],
+      "fixtures": [
+        "dash-vod-set"
+      ],
+      "id": "dash-vod-reference",
+      "isolation": "vm-only",
+      "layer": "proton-probe",
+      "negative_controls": [
+        "the finite HLS VOD member controls generic segmented playback",
+        "a malformed MPD or missing segment must fail within the operation deadline"
+      ],
+      "oracles": [
+        "stock GE, frozen Proton-RTSP, and candidate support classifications are recorded independently",
+        "a supported route fetches segments incrementally and lands on the requested timeline",
+        "an unsupported route fails once without a retry storm or contaminating the next source"
+      ],
+      "profiles": [
+        "parity",
+        "discovery"
+      ],
+      "status": "planned",
+      "timeout_s": 180
+    },
+    {
+      "actions": [
+        "play the finite Smooth Streaming presentation",
+        "seek to a fragment boundary",
+        "step the selected quality level once",
+        "reload the source"
+      ],
+      "fixtures": [
+        "smooth-vod-set"
+      ],
+      "id": "smooth-vod-reference",
+      "isolation": "vm-only",
+      "layer": "proton-probe",
+      "negative_controls": [
+        "the finite DASH member controls fragmented adaptive playback",
+        "a malformed manifest or missing fragment must fail within the operation deadline"
+      ],
+      "oracles": [
+        "stock GE, frozen Proton-RTSP, and candidate support classifications are recorded independently",
+        "a supported route maintains one A/V timeline through incremental fetch and seek",
+        "an unsupported route terminates cleanly and the following MP4 source succeeds"
+      ],
+      "profiles": [
+        "parity",
+        "discovery"
+      ],
+      "status": "planned",
+      "timeout_s": 180
+    },
+    {
+      "actions": [
+        "open a VM-private deterministic RTMP publication",
+        "play for two minutes",
+        "interrupt the publisher once and restore it",
+        "close and reopen the source"
+      ],
+      "fixtures": [
+        "rtmp-live-set"
+      ],
+      "id": "rtmp-live-reference",
+      "isolation": "vm-only",
+      "layer": "vm-proton",
+      "negative_controls": [
+        "RTSP over interleaved TCP controls generic live A/V playback",
+        "an absent endpoint must fail within the open deadline"
+      ],
+      "oracles": [
+        "stock GE, frozen Proton-RTSP, and candidate support classifications are recorded independently",
+        "a supported route maintains advancing nonzero audio and video through the declared interruption",
+        "an unsupported route fails within a bounded deadline and leaves no media worker"
+      ],
+      "profiles": [
+        "parity",
+        "discovery"
+      ],
+      "status": "planned",
+      "timeout_s": 240
+    },
+    {
+      "actions": [
+        "open rtsp URL over interleaved TCP",
+        "play 10 minutes",
+        "pause/play",
+        "reload five times"
+      ],
+      "fixtures": [
+        "rtsp-live-set"
+      ],
+      "id": "rtsp-live-tcp",
+      "isolation": "vm-only",
+      "layer": "proton-probe",
+      "negative_controls": [
+        "server stopped gives bounded open failure",
+        "video-only and audio-only members distinguish track discovery failures"
+      ],
+      "oracles": [
+        "video and audio start without a seek",
+        "source is live/nonseekable",
+        "clock advances by the second",
+        "every reload replaces the old session cleanly"
+      ],
+      "profiles": [
+        "base",
+        "parity"
+      ],
+      "status": "compose",
+      "timeout_s": 900
+    },
+    {
+      "actions": [
+        "open the same endpoint through rtspt",
+        "verify forced interleaved TCP",
+        "play and close"
+      ],
+      "fixtures": [
+        "rtsp-live-set"
+      ],
+      "id": "rtspt-forced-tcp",
+      "isolation": "vm-only",
+      "layer": "proton-probe",
+      "negative_controls": [
+        "invalid alias fails without rewriting the rest of the URL",
+        "literal rtsp control"
+      ],
+      "oracles": [
+        "only the scheme is normalized",
+        "transport is TCP",
+        "decoded behavior matches literal RTSP-over-TCP"
+      ],
+      "profiles": [
+        "base",
+        "parity"
+      ],
+      "status": "compose",
+      "timeout_s": 120
+    },
+    {
+      "actions": [
+        "while live issue backward, forward, and zero seeks",
+        "continue playback"
+      ],
+      "fixtures": [
+        "rtsp-live-set",
+        "hls-live-set"
+      ],
+      "id": "live-seek-rejected",
+      "isolation": "vm-only",
+      "layer": "proton-probe",
+      "negative_controls": [
+        "finite VOD performs a real Range/segment seek",
+        "frozen Proton-RTSP live route supplies reference behavior"
+      ],
+      "oracles": [
+        "Media Foundation does not advertise ordinary finite seeking",
+        "avformat_seek_file is not called",
+        "continuing A/V and clock are not disturbed"
+      ],
+      "profiles": [
+        "base",
+        "parity"
+      ],
+      "status": "compose",
+      "timeout_s": 90
+    },
+    {
+      "actions": [
+        "stop publisher during PLAY",
+        "repeat by stopping server",
+        "restart and manually reopen"
+      ],
+      "fixtures": [
+        "rtsp-live-set",
+        "rtsp-fault-service"
+      ],
+      "id": "rtsp-server-loss",
+      "isolation": "vm-only",
+      "layer": "vm-proton",
+      "negative_controls": [
+        "fault-free stream runs 60 seconds",
+        "automatic reconnect is not required unless separately implemented and tested"
+      ],
+      "oracles": [
+        "loss becomes a defined error or EOS matching the reference within 20 seconds",
+        "close does not hang",
+        "later manual reopen works without Steam or prefix restart"
+      ],
+      "profiles": [
+        "base",
+        "parity"
+      ],
+      "status": "planned",
+      "timeout_s": 180
+    },
+    {
+      "actions": [
+        "apply deterministic 1 percent then 5 percent loss",
+        "apply 100 ms jitter",
+        "apply 1 percent duplication and 5 percent reordering to UDP reference members"
+      ],
+      "fixtures": [
+        "rtsp-live-set",
+        "rtsp-fault-service"
+      ],
+      "id": "rtsp-loss-jitter-reorder",
+      "isolation": "vm-only",
+      "layer": "vm-proton",
+      "negative_controls": [
+        "zero-fault UDP member",
+        "forced-TCP rtspt member"
+      ],
+      "oracles": [
+        "outcome and recovery match or improve on frozen Proton-RTSP",
+        "live latency and memory remain bounded",
+        "TCP baseline remains unaffected"
+      ],
+      "profiles": [
+        "parity",
+        "discovery"
+      ],
+      "status": "planned",
+      "timeout_s": 900
+    },
+    {
+      "actions": [
+        "A/B rtsp, rtspu, rtspt, rtsph, rtsps, rtspsu, rtspst, and rtspsh against the frozen reference",
+        "record actual control and lower transport"
+      ],
+      "fixtures": [
+        "rtsp-live-set",
+        "rtsp-fault-service",
+        "tls-media-set"
+      ],
+      "id": "rtsp-alias-reference-matrix",
+      "isolation": "vm-only",
+      "layer": "vm-proton",
+      "negative_controls": [
+        "bare rtp, udp, and tcp URLs remain unsupported MF schemes",
+        "unknown alias fails without network escape"
+      ],
+      "oracles": [
+        "rtspt and rtspst are the credible forced-TCP parity gates",
+        "other aliases are promoted only if the frozen packaged reference succeeds",
+        "historical broken registrations are documented rather than copied"
+      ],
+      "profiles": [
+        "parity",
+        "discovery"
+      ],
+      "status": "planned",
+      "timeout_s": 1200
+    },
+    {
+      "actions": [
+        "play MP3 member through ten metadata blocks",
+        "repeat AAC member",
+        "pause/play and replace source"
+      ],
+      "fixtures": [
+        "icy-radio-live"
+      ],
+      "id": "icy-radio-continuity",
+      "isolation": "vm-only",
+      "layer": "proton-probe",
+      "negative_controls": [
+        "audio-only finite member",
+        "malformed metadata interval fails boundedly"
+      ],
+      "oracles": [
+        "continuous nonzero PCM",
+        "metadata never enters PCM",
+        "reference and candidate expose equivalent live/nonseekable behavior"
+      ],
+      "profiles": [
+        "parity",
+        "discovery"
+      ],
+      "status": "planned",
+      "timeout_s": 180
+    },
+    {
+      "actions": [
+        "open, play, seek, pause, resume, and EOS each member with identical elementary streams"
+      ],
+      "fixtures": [
+        "container-matrix"
+      ],
+      "id": "container-reference-matrix",
+      "isolation": "vm-only",
+      "layer": "proton-probe",
+      "negative_controls": [
+        "primary MP4 member",
+        "same codec tracks remuxed into another container"
+      ],
+      "oracles": [
+        "base-preserved formats do not regress stock GE",
+        "extended outcome matches or improves on frozen Proton-RTSP per member",
+        "container failure is not mislabeled as codec failure"
+      ],
+      "profiles": [
+        "parity",
+        "discovery"
+      ],
+      "status": "planned",
+      "timeout_s": 600
+    },
+    {
+      "actions": [
+        "open, play, seek, pause, resume, and EOS each codec member in its recorded container"
+      ],
+      "fixtures": [
+        "codec-matrix"
+      ],
+      "id": "codec-reference-matrix",
+      "isolation": "vm-only",
+      "layer": "proton-probe",
+      "negative_controls": [
+        "same container with H.264/AAC",
+        "malformed extradata member"
+      ],
+      "oracles": [
+        "H.264/AAC primary is mandatory",
+        "other outcomes match stock GE and frozen Proton-RTSP expectations recorded before patching",
+        "unsupported codec is one bounded error"
+      ],
+      "profiles": [
+        "parity",
+        "discovery"
+      ],
+      "status": "planned",
+      "timeout_s": 600
+    },
+    {
+      "actions": [
+        "play, seek, pause, resume, and EOS every sample-rate/channel member"
+      ],
+      "fixtures": [
+        "audio-format-matrix"
+      ],
+      "id": "audio-format-reference-matrix",
+      "isolation": "vm-only",
+      "layer": "proton-probe",
+      "negative_controls": [
+        "AAC stereo primary",
+        "unsupported format member must fail boundedly"
+      ],
+      "oracles": [
+        "accepted formats produce the expected PCM shape",
+        "resampling does not change clock slope",
+        "outcomes are compared against both references"
+      ],
+      "profiles": [
+        "parity",
+        "discovery"
+      ],
+      "status": "planned",
+      "timeout_s": 600
+    },
+    {
+      "actions": [
+        "play mono AAC and mono MP3 at the declared sample rates",
+        "seek, pause, resume, and replace with stereo primary"
+      ],
+      "fixtures": [
+        "media-edge-matrix",
+        "vod-primary"
+      ],
+      "id": "mono-audio-reference-matrix",
+      "isolation": "vm-only",
+      "layer": "proton-probe",
+      "negative_controls": [
+        "stereo AAC primary",
+        "audio-only topology without a channel conversion"
+      ],
+      "oracles": [
+        "accepted mono remains nonzero and centered after endpoint conversion",
+        "clock slope and seek recovery match the reference",
+        "replacement stereo topology is not contaminated"
+      ],
+      "profiles": [
+        "parity",
+        "discovery"
+      ],
+      "status": "planned",
+      "timeout_s": 240
+    },
+    {
+      "actions": [
+        "open variable-frame-rate and nonzero-start MP4 members",
+        "join at offset, seek backward and forward, then run through EOS"
+      ],
+      "fixtures": [
+        "media-edge-matrix"
+      ],
+      "id": "timeline-shape-reference-matrix",
+      "isolation": "vm-only",
+      "layer": "proton-probe",
+      "negative_controls": [
+        "constant-frame-rate zero-start primary",
+        "malformed nonmonotonic timestamp member"
+      ],
+      "oracles": [
+        "presentation follows packet PTS rather than frame count",
+        "initial offset is preserved or rebased exactly as the frozen reference",
+        "seek and EOS remain bounded"
+      ],
+      "profiles": [
+        "parity",
+        "discovery"
+      ],
+      "status": "planned",
+      "timeout_s": 300
+    },
+    {
+      "actions": [
+        "play members with subtitle, data, and cover-art streams",
+        "reload and replace with the primary"
+      ],
+      "fixtures": [
+        "media-edge-matrix",
+        "vod-primary"
+      ],
+      "id": "auxiliary-stream-selection",
+      "isolation": "vm-only",
+      "layer": "proton-probe",
+      "negative_controls": [
+        "same A/V without auxiliary tracks",
+        "audio-only and video-only topologies"
+      ],
+      "oracles": [
+        "cover art never replaces the intended moving video",
+        "subtitle/data tracks never become audio or video sinks",
+        "selected A/V and later replacement remain stable"
+      ],
+      "profiles": [
+        "parity",
+        "discovery"
+      ],
+      "status": "planned",
+      "timeout_s": 240
+    },
+    {
+      "actions": [
+        "probe H.264 Baseline, Main, and High members across declared level, resolution, and frame-rate boundaries",
+        "follow every unsupported member with vod-primary"
+      ],
+      "fixtures": [
+        "media-edge-matrix",
+        "vod-primary"
+      ],
+      "id": "h264-boundary-reference-matrix",
+      "isolation": "vm-only",
+      "layer": "proton-probe",
+      "negative_controls": [
+        "required H.264 Main primary",
+        "unsupported-codec member separates decoder absence from a boundary"
+      ],
+      "oracles": [
+        "required baseline remains preserved",
+        "each boundary matches or improves the frozen references",
+        "unsupported members fail once without oversized allocation or contamination"
+      ],
+      "profiles": [
+        "parity",
+        "discovery"
+      ],
+      "status": "planned",
+      "timeout_s": 900
+    },
+    {
+      "actions": [
+        "play through declared midstream audio-format and video-resolution changes",
+        "pause and seek on each side of the transition"
+      ],
+      "fixtures": [
+        "media-edge-matrix"
+      ],
+      "id": "midstream-format-transition",
+      "isolation": "vm-only",
+      "layer": "proton-probe",
+      "negative_controls": [
+        "fixed-format source with the same duration",
+        "undeclared corrupt transition fails boundedly"
+      ],
+      "oracles": [
+        "declared transition does not permanently lose either track",
+        "clock and source generation remain coherent",
+        "surface/audio topology is renegotiated without a worker leak"
+      ],
+      "profiles": [
+        "parity",
+        "discovery"
+      ],
+      "status": "planned",
+      "timeout_s": 300
+    },
+    {
+      "actions": [
+        "open every malformed member with a fresh source generation",
+        "after each failure open vod-primary"
+      ],
+      "fixtures": [
+        "malformed-media-set",
+        "vod-primary"
+      ],
+      "id": "malformed-media-recovery",
+      "isolation": "vm-only",
+      "layer": "vm-proton",
+      "negative_controls": [
+        "vod-primary succeeds",
+        "native ffprobe classification records whether each member is parser-invalid or decoder-unsupported"
+      ],
+      "oracles": [
+        "no crash, hang, large allocation, or retry storm",
+        "one bounded error per invalid source",
+        "known-good playback remains intact"
+      ],
+      "profiles": [
+        "base",
+        "parity",
+        "discovery"
+      ],
+      "status": "planned",
+      "timeout_s": 600
+    },
+    {
+      "actions": [
+        "run 100 open/play-for-two-seconds/close cycles for each route",
+        "alternate source destruction before and after server stop"
+      ],
+      "fixtures": [
+        "vod-primary",
+        "hls-live-set",
+        "rtsp-live-set"
+      ],
+      "id": "repeated-open-close",
+      "isolation": "vm-only",
+      "layer": "vm-proton",
+      "negative_controls": [
+        "five-cycle warmup is excluded from slope",
+        "intentionally retained handle makes the resource oracle fail"
+      ],
+      "oracles": [
+        "every close completes within 5 seconds when cancellation is requested",
+        "after five-second settle thread and descriptor counts return to baseline plus four",
+        "last 50-cycle RSS slope is below 256 KiB per cycle and final delta below 64 MiB"
+      ],
+      "profiles": [
+        "base",
+        "parity"
+      ],
+      "status": "planned",
+      "timeout_s": 1800
+    },
+    {
+      "actions": [
+        "run one, two, four, and eight independent MediaEngine instances",
+        "stagger starts by one second",
+        "seek and close them in reverse order"
+      ],
+      "fixtures": [
+        "vod-primary",
+        "hls-live-set",
+        "rtsp-live-set"
+      ],
+      "id": "concurrent-player-bounds",
+      "isolation": "vm-only",
+      "layer": "vm-proton",
+      "negative_controls": [
+        "single-player baseline",
+        "VRChat URL rate limiting is excluded from the standalone concurrency result"
+      ],
+      "oracles": [
+        "one player cannot block another",
+        "per-stream packet bounds hold",
+        "resource growth is monotonic and approximately linear rather than explosive",
+        "all resources return after close"
+      ],
+      "profiles": [
+        "base",
+        "parity"
+      ],
+      "status": "planned",
+      "timeout_s": 900
+    },
+    {
+      "actions": [
+        "hold four readers after headers",
+        "sample RSS, thread, descriptor, request-token, and packet-queue counts for 60 seconds",
+        "cancel all"
+      ],
+      "fixtures": [
+        "http-fault-service",
+        "rtsp-fault-service"
+      ],
+      "id": "blocked-input-resource-bound",
+      "isolation": "vm-only",
+      "layer": "vm-proton",
+      "negative_controls": [
+        "fault-free playback baseline",
+        "instrumentation self-test detects a synthetic increasing counter"
+      ],
+      "oracles": [
+        "no busy request loop",
+        "known packet limits are never exceeded",
+        "RSS slope after warmup is below 1 MiB per minute per player",
+        "cancel joins all workers"
+      ],
+      "profiles": [
+        "base",
+        "parity"
+      ],
+      "status": "planned",
+      "timeout_s": 180
+    },
+    {
+      "actions": [
+        "trust only the ephemeral VM CA",
+        "open valid, self-signed, expired, and wrong-host roots",
+        "exercise downgrade redirect and mixed-origin HLS"
+      ],
+      "fixtures": [
+        "tls-media-set"
+      ],
+      "id": "tls-and-nested-protocol-policy",
+      "isolation": "vm-only",
+      "layer": "vm-proton",
+      "negative_controls": [
+        "valid localhost leaf succeeds",
+        "the same CA is not installed on the host or any Steam prefix"
+      ],
+      "oracles": [
+        "peer and hostname validation are enabled",
+        "only explicitly allowed nested protocols proceed",
+        "invalid trust cannot fall back to insecure media"
+      ],
+      "profiles": [
+        "base",
+        "parity"
+      ],
+      "status": "planned",
+      "timeout_s": 300
+    },
+    {
+      "actions": [
+        "launch a path-qualified managed yt-dlp.exe",
+        "repeat with optional PROTON_YTDLP_PATH",
+        "exercise success, timeout, malformed output, and error"
+      ],
+      "fixtures": [
+        "yt-dlp-stub"
+      ],
+      "id": "yt-dlp-process-contract",
+      "isolation": "vm-only",
+      "layer": "proton-probe",
+      "negative_controls": [
+        "unqualified and differently named processes are untouched",
+        "no hook is added unless stock GE first reproduces a causal VRChat failure"
+      ],
+      "oracles": [
+        "ordinary GE process launch remains the default",
+        "opt-in replacement preserves argv",
+        "no executable is bundled or downloaded",
+        "child cleanup is bounded"
+      ],
+      "profiles": [
+        "parity"
+      ],
+      "status": "planned",
+      "timeout_s": 120
+    },
+    {
+      "actions": [
+        "SetAutoPlay before SetSource and load",
+        "repeat by setting it during load and after Ready",
+        "interleave a later explicit Pause and Play"
+      ],
+      "fixtures": [
+        "vod-primary"
+      ],
+      "id": "autoplay-load-order-reference",
+      "isolation": "vm-only",
+      "layer": "proton-probe",
+      "negative_controls": [
+        "AutoPlay false requires an explicit Play",
+        "a later explicit Pause must never be overridden by an older autoplay decision"
+      ],
+      "oracles": [
+        "the frozen Proton-RTSP and stock-GE outcomes are recorded for each ordering before a semantic patch is proposed",
+        "candidate behavior is deterministic across 20 repetitions",
+        "no source starts twice and latest explicit Play/Pause intent wins"
+      ],
+      "profiles": [
+        "parity",
+        "discovery"
+      ],
+      "status": "planned",
+      "timeout_s": 180
+    },
+    {
+      "actions": [
+        "stall a progressive HTTP body for five seconds after playback starts",
+        "issue Pause and Play while stalled",
+        "resume the body and then seek once"
+      ],
+      "fixtures": [
+        "vod-primary",
+        "http-fault-service"
+      ],
+      "id": "buffering-command-events",
+      "isolation": "vm-only",
+      "layer": "vm-proton",
+      "negative_controls": [
+        "the no-stall member emits no synthetic buffering interval",
+        "a stall beyond the I/O deadline becomes terminal rather than emitting a false recovery"
+      ],
+      "oracles": [
+        "buffering start and stop transitions match the frozen Proton-RTSP event contract",
+        "command completions preserve caller order and latest explicit intent",
+        "clock does not race ahead during starvation",
+        "resumed audio and video return from one generation"
+      ],
+      "profiles": [
+        "parity"
+      ],
+      "status": "planned",
+      "timeout_s": 120
+    },
+    {
+      "actions": [
+        "run PlayURL/LoadURL as the test world exposes them",
+        "play, pause, seek, reload, stop, and leave world",
+        "repeat AVPro and Unity Video only where each frontend claims support"
+      ],
+      "fixtures": [
+        "vod-primary",
+        "hls-vod-set",
+        "hls-live-set",
+        "rtsp-live-set"
+      ],
+      "id": "vrchat-single-player-controls",
+      "isolation": "manual-product",
+      "layer": "vrchat-single",
+      "negative_controls": [
+        "known-good stock GE local/HLS canaries",
+        "working frozen Proton-RTSP route",
+        "frontend failure is not automatically a backend failure"
+      ],
+      "oracles": [
+        "OnVideoReady/Start/Play/Pause/End/Error order is recorded",
+        "visible clock, moving frame, and player audio agree",
+        "AVPro live succeeds without requiring Unity Video live support"
+      ],
+      "profiles": [
+        "base",
+        "parity"
+      ],
+      "status": "manual-vrchat",
+      "timeout_s": 1800
+    },
+    {
+      "actions": [
+        "owner starts VOD",
+        "second client joins when owner media time is 47.250",
+        "repeat cold and warm"
+      ],
+      "fixtures": [
+        "vod-primary",
+        "http-fault-service"
+      ],
+      "id": "multiplayer-late-join",
+      "isolation": "manual-product",
+      "layer": "vrchat-multiplayer",
+      "negative_controls": [
+        "single-client join-at-offset probe",
+        "second client joining at source start"
+      ],
+      "oracles": [
+        "late client begins incremental loading rather than waiting for full VOD",
+        "first stable time is within 1.250 seconds of owner",
+        "clients reconverge within 3 seconds without seek storm"
+      ],
+      "profiles": [
+        "base",
+        "parity"
+      ],
+      "status": "manual-vrchat",
+      "timeout_s": 300
+    },
+    {
+      "actions": [
+        "owner pauses at 37.500",
+        "second client joins",
+        "owner resumes after both report ready"
+      ],
+      "fixtures": [
+        "vod-primary"
+      ],
+      "id": "multiplayer-join-paused",
+      "isolation": "manual-product",
+      "layer": "vrchat-multiplayer",
+      "negative_controls": [
+        "compiled pause-scrub probe",
+        "ordinary late join while playing"
+      ],
+      "oracles": [
+        "both clocks remain stationary while paused",
+        "latest pause intent survives initial scrub",
+        "resume advances both streams and clients",
+        "paused-surface appearance is compared to reference"
+      ],
+      "profiles": [
+        "base",
+        "parity"
+      ],
+      "status": "manual-vrchat",
+      "timeout_s": 300
+    },
+    {
+      "actions": [
+        "send deterministic plus/minus 150 ms corrections every two seconds for two minutes",
+        "then send one 12-second correction"
+      ],
+      "fixtures": [
+        "vod-primary"
+      ],
+      "id": "multiplayer-correction-drizzle",
+      "isolation": "manual-product",
+      "layer": "vrchat-multiplayer",
+      "negative_controls": [
+        "no-correction two-client baseline",
+        "301-call standalone seek stress verifies coalescer instrumentation"
+      ],
+      "oracles": [
+        "small corrections do not become backend seek storms",
+        "large correction produces one coalesced seek",
+        "clients reconverge within 3 seconds with A/V"
+      ],
+      "profiles": [
+        "base",
+        "parity"
+      ],
+      "status": "manual-vrchat",
+      "timeout_s": 300
+    },
+    {
+      "actions": [
+        "late client begins slow old load",
+        "owner seeks",
+        "owner replaces URL before old completion",
+        "allow packets and sync messages to arrive out of order"
+      ],
+      "fixtures": [
+        "vod-primary",
+        "topology-video-only",
+        "http-fault-service"
+      ],
+      "id": "multiplayer-load-seek-replace-race",
+      "isolation": "manual-product",
+      "layer": "vrchat-multiplayer",
+      "negative_controls": [
+        "standalone source-generation race",
+        "same action order after old load completes"
+      ],
+      "oracles": [
+        "only newest URL and generation survive",
+        "old seek/time correction cannot affect new source",
+        "both clients converge on new source"
+      ],
+      "profiles": [
+        "base",
+        "parity"
+      ],
+      "status": "manual-vrchat",
+      "timeout_s": 360
+    },
+    {
+      "actions": [
+        "stall only the follower client in the VM-assisted network lab",
+        "keep owner connected",
+        "restore follower"
+      ],
+      "fixtures": [
+        "vod-primary",
+        "hls-live-set"
+      ],
+      "id": "multiplayer-one-client-stall",
+      "isolation": "manual-product",
+      "layer": "vrchat-multiplayer",
+      "negative_controls": [
+        "stall server for both clients",
+        "fault-free two-client baseline"
+      ],
+      "oracles": [
+        "owner playback never stalls",
+        "follower recovers or errors according to route policy",
+        "a recovered VOD follower reconverges within 5 seconds",
+        "live follower returns near live edge without latency staircase"
+      ],
+      "profiles": [
+        "base",
+        "parity"
+      ],
+      "status": "manual-vrchat",
+      "timeout_s": 420
+    },
+    {
+      "actions": [
+        "owner issues a large seek correction",
+        "disconnect or transfer ownership before the correction completes",
+        "deliver delayed old-owner state after the new owner publishes its position"
+      ],
+      "fixtures": [
+        "vod-primary",
+        "http-fault-service"
+      ],
+      "id": "multiplayer-owner-transfer-seek-race",
+      "isolation": "manual-product",
+      "layer": "vrchat-multiplayer",
+      "negative_controls": [
+        "owner transfer without an in-flight correction",
+        "standalone source/timeline generation race"
+      ],
+      "oracles": [
+        "new-owner generation wins permanently",
+        "delayed old-owner seek cannot move either client",
+        "clients converge with advancing audio and video without reloading the URL"
+      ],
+      "profiles": [
+        "base",
+        "parity"
+      ],
+      "status": "manual-vrchat",
+      "timeout_s": 420
+    },
+    {
+      "actions": [
+        "start live HLS and RTSP with the owner at steady live edge",
+        "late-join a follower under asymmetric per-client delay",
+        "remove the delay and observe reconvergence"
+      ],
+      "fixtures": [
+        "hls-live-set",
+        "rtsp-live-set",
+        "rtsp-fault-service"
+      ],
+      "id": "multiplayer-live-late-join-asymmetric",
+      "isolation": "manual-product",
+      "layer": "vrchat-multiplayer",
+      "negative_controls": [
+        "fault-free live late join",
+        "finite VOD late join uses an owner media-time correction"
+      ],
+      "oracles": [
+        "non-DVR live follower selects the current live edge instead of seeking to owner wall-clock offset",
+        "clean owner remains unaffected by follower delay",
+        "follower returns near live edge without a latency staircase or permanent audio loss"
+      ],
+      "profiles": [
+        "base",
+        "parity"
+      ],
+      "status": "manual-vrchat",
+      "timeout_s": 600
+    },
+    {
+      "actions": [
+        "join a world with two active video players",
+        "first attempt simultaneous URL loads",
+        "repeat with starts staggered by at least five seconds"
+      ],
+      "fixtures": [
+        "vod-primary",
+        "topology-video-only"
+      ],
+      "id": "multiplayer-multiple-player-rate-limit",
+      "isolation": "manual-product",
+      "layer": "vrchat-multiplayer",
+      "negative_controls": [
+        "single active player",
+        "standalone concurrent-player test bypasses the VRChat URL limiter"
+      ],
+      "oracles": [
+        "simultaneous case may report VRChat RateLimited and is not a Proton defect",
+        "staggered case loads both and keeps them independent",
+        "teardown leaves neither session behind"
+      ],
+      "profiles": [
+        "base",
+        "parity",
+        "discovery"
+      ],
+      "status": "manual-vrchat",
+      "timeout_s": 360
+    },
+    {
+      "actions": [
+        "transfer Udon ownership during playback",
+        "repeat while paused",
+        "repeat while a large correction is pending"
+      ],
+      "fixtures": [
+        "vod-primary"
+      ],
+      "id": "multiplayer-owner-transfer",
+      "isolation": "manual-product",
+      "layer": "vrchat-multiplayer",
+      "negative_controls": [
+        "same Udon world under stock GE distinguishes world-script defects",
+        "no-transfer multiplayer baseline"
+      ],
+      "oracles": [
+        "media backend does not restart unless the world sends a new source",
+        "new owner corrections converge",
+        "no old-owner message resurrects an earlier generation"
+      ],
+      "profiles": [
+        "parity",
+        "discovery"
+      ],
+      "status": "manual-vrchat",
+      "timeout_s": 420
+    },
+    {
+      "actions": [
+        "submit one stable allowlisted VOD page URL",
+        "record yt-dlp process success and returned direct URL class",
+        "play returned route",
+        "repeat one live page only while visibly live"
+      ],
+      "fixtures": [],
+      "id": "vrchat-site-resolver-boundary",
+      "isolation": "manual-product",
+      "layer": "vrchat-single",
+      "negative_controls": [
+        "direct loopback media bypasses yt-dlp",
+        "yt-dlp stub tests process behavior without a public site"
+      ],
+      "oracles": [
+        "resolver success and media playback are scored separately",
+        "returned protocol enters a supported route",
+        "no Proton patch is inferred from an upstream site outage"
+      ],
+      "profiles": [
+        "base",
+        "parity",
+        "discovery"
+      ],
+      "status": "manual-vrchat",
+      "timeout_s": 600
+    }
+  ],
+  "schema_version": 1,
+  "suite_id": "vrchat-mediaengine-stress-v1"
+}

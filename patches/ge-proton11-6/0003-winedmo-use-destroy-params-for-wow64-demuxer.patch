@@ -1,0 +1,25 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: RTSP-on-GE11 contributors <noreply@invalid>
+Date: Mon, 13 Jul 2026 16:47:40 -0500
+Subject: [PATCH alpha 3/4] winedmo: Use destroy parameters for WOW64 demuxer
+ teardown
+
+wow64_demuxer_destroy() passes its local object to demuxer_destroy(), which interprets it as struct demuxer_destroy_params. Using the larger create structure places the demuxer handle at a different offset, so the 64-bit Unix side can read the wrong handle during 32-bit media teardown.
+
+Use the matching destroy structure and initialize it before marshalling.
+
+A3.19: rebased after GE-Proton11-6's ge-video-rework set.
+---
+diff --git a/dlls/winedmo/unixlib.c b/dlls/winedmo/unixlib.c
+index 657e498c1aab8004deff12eba61cabfe7646660a..dc4b7be31d1b04dd6c02f09a111c034d7383b44c 100644
+--- a/dlls/winedmo/unixlib.c
++++ b/dlls/winedmo/unixlib.c
+@@ -227,7 +227,7 @@ static NTSTATUS wow64_demuxer_destroy( void *arg )
+         struct winedmo_demuxer demuxer;
+         PTR32 context;
+     } *params32 = arg;
+-    struct demuxer_create_params params;
++    struct demuxer_destroy_params params = {0};
+     NTSTATUS status;
+ 
+     params.demuxer = params32->demuxer;

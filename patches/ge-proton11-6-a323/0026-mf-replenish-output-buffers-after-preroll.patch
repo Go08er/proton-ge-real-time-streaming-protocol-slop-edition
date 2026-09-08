@@ -1,0 +1,52 @@
+From: RTSP-on-GE11 contributors
+Subject: [PATCH] mf: replenish transform output buffers after dropping preroll
+
+Mark-in filtering releases samples before the requested start position and
+sets NO_SAMPLE. The next ProcessOutput call must get a fresh output buffer,
+not that released sample and stale status. Caller-allocated transforms such
+as the WineDMO AAC decoder otherwise fail, stranding the audio-driven clock.
+
+Allocate at the start of each drain iteration and release/reset only when
+mark-in discarded all output. Events or accepted output still leave the loop
+for normal delivery. Preserve transform-owned samples and stream changes.
+This does not retry a seek, change timestamps, or add demand or a timer.
+
+Regression: run_hls_clock.py on immutable A3.22-R2 starts HLS but seeking to
+25 seconds yields one frame and a frozen clock; the matching MP4 passes.
+
+diff --git a/dlls/mf/session.c b/dlls/mf/session.c
+--- a/dlls/mf/session.c
++++ b/dlls/mf/session.c
+@@ -3907,13 +3907,12 @@ static HRESULT transform_node_pull_samples(const struct media_session *session, st
+ 
+     if (!(buffers = calloc(node->u.transform.output_count, sizeof(*buffers))))
+         return E_OUTOFMEMORY;
+-    if (FAILED(hr = allocate_output_samples(session, node, buffers)))
+-        goto done;
+-
+-    status = 0;
+ 
+-    do
++    for (;;)
+     {
++        if (FAILED(hr = allocate_output_samples(session, node, buffers)))
++            goto done;
++        status = 0;
+         hr = IMFTransform_ProcessOutput(node->object.transform, 0, node->u.transform.output_count, buffers, &status);
+         if (hr == MF_E_TRANSFORM_STREAM_CHANGE && SUCCEEDED(hr = transform_node_format_changed(node, buffers)))
+         {
+@@ -3926,8 +3925,13 @@ static HRESULT transform_node_pull_samples(const struct media_session *session, st
+ 
+             hr = IMFTransform_ProcessOutput(node->object.transform, 0, node->u.transform.output_count, buffers, &status);
+         }
++        if (hr != S_OK || !transform_node_markin_need_more_input(session, node, buffers))
++            break;
++
++        /* Mark-in may have released caller-allocated samples. Replenish them. */
++        release_output_samples(node, buffers);
++        memset(buffers, 0, node->u.transform.output_count * sizeof(*buffers));
+     }
+-    while (hr == S_OK && transform_node_markin_need_more_input(session, node, buffers));
+ 
+     if (hr == MF_E_TRANSFORM_NEED_MORE_INPUT)
+         node->flags |= TOPO_NODE_TRANSFORM_NEEDS_INPUT;

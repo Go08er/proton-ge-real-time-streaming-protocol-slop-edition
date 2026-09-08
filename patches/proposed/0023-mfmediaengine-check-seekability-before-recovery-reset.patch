@@ -1,0 +1,45 @@
+From: RTSP-on-GE11 contributors <noreply@invalid>
+Subject: [PROPOSED] mfmediaengine: let the seek helper own recovery resets
+
+Review overlay against the final A3.19 Wine tree, not an integrated patch.
+No current pin, series, prepared source, or installed artifact is changed.
+
+The inherited OnVideoStreamTick recovery branches clear the frame sink
+before calling media_engine_set_current_time(). That helper first checks
+MFSESSIONCAP_SEEK and returns without seeking when the capability is absent
+or its query fails. The preceding reset has already dropped queued and
+presentation samples and cleared sample_request_pending, without submitting
+replacement demand. A refused recovery can therefore damage a live source.
+
+Remove only the redundant caller resets. The helper already resets after
+checking capability and before an accepted seek/paused seek. Its intentional
+early returns (including logical end and coalesced seek) now keep their own
+semantics. No retry, new recovery condition, threshold, error suppression,
+GetSeekable compatibility change, or queue-size change is introduced.
+
+Neither recovery warning appeared in the captured A3.19 session, so this is
+a source-level preventive correction, NOT an explanation of the observed
+episode #331 seek stalls or WaterWolf quality. Python model tests are not
+Wine runtime or playback validation.
+
+The license of the modified Wine source file applies to this patch.
+---
+diff --git a/dlls/mfmediaengine/main.c b/dlls/mfmediaengine/main.c
+--- a/dlls/mfmediaengine/main.c
++++ b/dlls/mfmediaengine/main.c
+@@ -4277,7 +4277,6 @@ static HRESULT WINAPI media_engine_OnVideoStreamTick(IMFMediaEngineEx *iface, LONGLONG *pts)
+             {
+                 WARN("Video sample %.6f is too far ahead of clock %.6f; resynchronizing.\n",
+                         mftime_to_seconds(*pts), mftime_to_seconds(clocktime));
+-                video_frame_sink_reset(engine->presentation.frame_sink);
+                 media_engine_set_current_time(engine, mftime_to_seconds(clocktime));
+                 *pts = MINLONGLONG;
+             }
+@@ -4296,7 +4295,6 @@ static HRESULT WINAPI media_engine_OnVideoStreamTick(IMFMediaEngineEx *iface, LONGLONG *pts)
+                         WARN("Presentation clock stalled at %.6f; restarting stream.\n",
+                                 mftime_to_seconds(clocktime));
+                         engine->stalled_clock_seek_time = now;
+-                        video_frame_sink_reset(engine->presentation.frame_sink);
+                         media_engine_set_current_time(engine, mftime_to_seconds(clocktime));
+                         *pts = MINLONGLONG;
+                     }

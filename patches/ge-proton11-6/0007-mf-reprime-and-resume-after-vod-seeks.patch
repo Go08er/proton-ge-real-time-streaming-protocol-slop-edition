@@ -1,0 +1,107 @@
+From 6ae526eff3f93a2aff87a23b40bb4ea4ae053e64 Mon Sep 17 00:00:00 2001
+From: RTSP-on-GE11 contributors <noreply@invalid>
+Date: Thu, 16 Jul 2026 23:15:00 -0500
+Subject: [PATCH 7/7] mf: re-prime and resume after VOD seeks
+
+Restore the Media Foundation pull-chain recovery that GE's media-session
+rework accidentally removed. A seek clears transform requests while already
+accounted sink demand survives. Once every source and selected stream has
+restarted, re-drive one request per sink, flush pre-seek sink samples, and
+only then start the presentation clock. This restores Wine's existing seek
+ordering without adding a retry loop or manufacturing demand the sink did
+not request.
+
+Also make the newest in-flight seek target authoritative. A direct or
+deferred target which duplicates the completing seek within Wine's existing
+one millisecond tolerance cancels an older queued target. Handle both
+timer/completion orderings while preserving nearby SetCurrentTimeEx() calls
+as real seeks, as required by the interface.
+
+The license of the modified Wine source files applies to this patch.
+
+A3.19: rebased after GE-Proton11-6's ge-video-rework set.
+---
+diff --git a/dlls/mf/session.c b/dlls/mf/session.c
+index 6975c99d37422bc70198bf67566af96d205a2ded..df8548e3c588ed9eea2081bb0aa97953f4296fa9 100644
+--- a/dlls/mf/session.c
++++ b/dlls/mf/session.c
+@@ -1110,6 +1110,25 @@ static void session_flush_transforms(struct media_session *session)
+ }
+ 
+ static void session_request_sample(struct media_session *session, IMFStreamSink *sink_stream);
++
++static void session_flush_sinks(struct media_session *session)
++{
++    struct topo_node *node;
++
++    LIST_FOR_EACH_ENTRY(node, &session->presentation.nodes, struct topo_node, entry)
++    {
++        if (node->type == MF_TOPOLOGY_OUTPUT_NODE)
++        {
++            if (node->u.sink.requests)
++            {
++                node->u.sink.requests--; /* session_request_sample() restores it. */
++                session_request_sample(session, node->object.sink_stream);
++            }
++            IMFStreamSink_Flush(node->object.sink_stream);
++        }
++    }
++}
++
+ static HRESULT session_get_stream_sink_type(IMFStreamSink *sink, IMFMediaType **media_type);
+ static HRESULT session_start_clock(struct media_session *session);
+ 
+@@ -3323,6 +3342,12 @@ static void session_set_source_object_state(struct media_session *session, IUnkn
+             }
+             else
+             {
++                if (session->presentation.flags & SESSION_FLAG_RESTARTING)
++                {
++                    session->presentation.flags &= ~SESSION_FLAG_RESTARTING;
++                    session_flush_sinks(session);
++                }
++
+                 if (SUCCEEDED(hr = session_start_clock(session)))
+                 {
+                     /* If sinks are already started, start session immediately. This can happen when doing a
+diff --git a/dlls/mfmediaengine/main.c b/dlls/mfmediaengine/main.c
+index 38aa13f8046db36cd17b003fcac66050db9d4b7f..5af8724ac916d355c87a04bd4332d06ca1bc2e0b 100644
+--- a/dlls/mfmediaengine/main.c
++++ b/dlls/mfmediaengine/main.c
+@@ -1154,9 +1154,20 @@ static HRESULT WINAPI media_engine_session_events_Invoke(IMFAsyncCallback *iface
+             if (engine->flags & FLAGS_ENGINE_SEEKING)
+             {
+                 BOOL deferred_seek_pending = engine->flags & FLAGS_ENGINE_DEFERRED_SEEK;
+-                double next_seek = deferred_seek_pending ? NAN : engine->next_seek;
++                double next_seek = deferred_seek_pending ? NAN : engine->next_seek; /* Deferred target wins. */
+                 double current_seek = engine->current_seek;
+ 
++                /* A deferred duplicate may still be waiting for its timer when
++                 * the positioned Start() completes. It is the newest target,
++                 * so it also supersedes any older queued seek. */
++                if (deferred_seek_pending && isfinite(current_seek) && isfinite(engine->deferred_seek)
++                        && fabs(engine->deferred_seek - current_seek) <= 0.001)
++                {
++                    engine->deferred_seek = NAN;
++                    media_engine_set_flag(engine, FLAGS_ENGINE_DEFERRED_SEEK, FALSE);
++                    deferred_seek_pending = FALSE;
++                }
++
+                 engine->current_seek = NAN;
+                 engine->next_seek = NAN;
+                 media_engine_set_flag(engine, FLAGS_ENGINE_SEEKING | FLAGS_ENGINE_IS_ENDED, FALSE);
+@@ -2593,8 +2604,12 @@ static HRESULT media_engine_set_current_time(struct media_engine *engine, double
+ 
+     if (engine->flags & FLAGS_ENGINE_SEEKING)
+     {
+-        if ((isfinite(engine->current_seek) && fabs(engine->current_seek - seektime) <= 0.001)
+-                || (isfinite(engine->next_seek) && fabs(engine->next_seek - seektime) <= 0.001))
++        if (isfinite(engine->current_seek) && fabs(engine->current_seek - seektime) <= 0.001)
++        {
++            engine->next_seek = NAN;
++            return S_OK;
++        }
++        if (isfinite(engine->next_seek) && fabs(engine->next_seek - seektime) <= 0.001)
+             return S_OK;
+ 
+         engine->next_seek = seektime;

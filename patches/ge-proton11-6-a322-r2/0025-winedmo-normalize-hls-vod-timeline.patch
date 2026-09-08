@@ -1,0 +1,114 @@
+From: RTSP-on-GE11 contributors <noreply@invalid>
+Subject: [PATCH] winedmo: map HLS VOD seeks and samples to one presentation origin
+
+Media Foundation starts a stopped source at position zero. FFmpeg HLS seeks
+use the source timestamp domain: with ordinary MPEG-TS mux offsets, zero is
+before the first segment and the initial seek fails. The existing GE origin
+normalization covers live HLS only, leaving finite HLS affected.
+
+Probe HLS timing before publishing the source, retain one common origin for
+all streams, subtract it from exposed sample timestamps and add it to seek
+targets. Preserve the original live-window anchor and the unseekable-source
+guard. Saturating arithmetic avoids introducing overflow at the conversion
+boundary. No retries, timeout changes or changes to non-HLS routes.
+
+Reproduced on actual A3.21 and A3.22: PCM/NV12 reads pass for timestamp-zero
+TS but hang after a failed initial seek for the same content with a 1.4 s
+mux offset. The shipped FFmpeg returns -1 for seek zero and succeeds in the
+source timestamp domain. This patch addresses the origin mismatch, not
+SourceReader's separate failure-event handling.
+
+The modified Wine file's license applies.
+---
+diff --git a/dlls/winedmo/unix_demuxer.c b/dlls/winedmo/unix_demuxer.c
+--- a/dlls/winedmo/unix_demuxer.c
++++ b/dlls/winedmo/unix_demuxer.c
+@@ -30,6 +30,7 @@
+ 
+ #ifdef HAVE_FFMPEG
+ 
++#include <libavutil/common.h>
+ #include <libavutil/time.h>
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(dmo);
+@@ -72,7 +73,7 @@
+     struct stream_context *stream_context;
+     struct stream *streams;
+     INT64 duration;
+-    INT64 live_timestamp_base;
++    INT64 hls_timestamp_base;
+     BOOL direct_url;
+     BOOL require_avio_seek;
+     BOOL cancelled_read_pending_recovery;
+@@ -253,15 +254,15 @@
+         sample->dts = max( 0, sample->dts - stream->timestamp_base );
+ }
+ 
+-static void normalize_live_hls_timestamps( const struct demuxer *demuxer, struct sample *sample )
++static void normalize_hls_timestamps( const struct demuxer *demuxer, struct sample *sample )
+ {
+-    if (demuxer->live_timestamp_base == AV_NOPTS_VALUE)
++    if (demuxer->hls_timestamp_base == AV_NOPTS_VALUE)
+         return;
+ 
+     if (sample->pts != AV_NOPTS_VALUE)
+-        sample->pts = max( 0, sample->pts - demuxer->live_timestamp_base );
++        sample->pts = max( 0, av_sat_sub64( sample->pts, demuxer->hls_timestamp_base ) );
+     if (sample->dts != AV_NOPTS_VALUE)
+-        sample->dts = max( 0, sample->dts - demuxer->live_timestamp_base );
++        sample->dts = max( 0, av_sat_sub64( sample->dts, demuxer->hls_timestamp_base ) );
+ }
+ 
+ static void fixup_asf_mpeg4_timestamps( const AVFormatContext *ctx, AVStream *avstream,
+@@ -971,7 +972,7 @@
+ 
+     if (!(demuxer = calloc( 1, sizeof(*demuxer) ))) return STATUS_NO_MEMORY;
+     demuxer->stream_context = params->context;
+-    demuxer->live_timestamp_base = AV_NOPTS_VALUE;
++    demuxer->hls_timestamp_base = AV_NOPTS_VALUE;
+ 
+     if (!(demuxer->ctx = avformat_alloc_context())) goto failed;
+     if (is_http_hls_url( params->url ))
+@@ -1106,7 +1107,7 @@
+     }
+     format = demuxer->ctx->iformat;
+     if ((params->duration = get_context_duration( demuxer->ctx, !demuxer->direct_url )) == AV_NOPTS_VALUE ||
+-        strstr( format->name, "mp3" ) || strstr( format->name, "mpeg" ) ||
++        strstr( format->name, "mp3" ) || strstr( format->name, "mpeg" ) || strstr( format->name, "hls" ) ||
+         context_has_video_missing_frame_rate( demuxer->ctx ) ||
+         (strstr( format->name, "mp4" ) && context_has_h264_codec_aligned_dimensions( demuxer->ctx )))
+     {
+@@ -1121,10 +1122,11 @@
+         params->duration = get_context_duration( demuxer->ctx, !demuxer->direct_url );
+     }
+     demuxer->duration = params->duration;
+-    if (demuxer->duration == AV_NOPTS_VALUE && demuxer->ctx->start_time != AV_NOPTS_VALUE &&
++    /* MF positions and samples share a zero-based HLS presentation timeline. */
++    if (demuxer->ctx->start_time != AV_NOPTS_VALUE &&
+         strstr( format->name, "hls" ))
+     {
+-        demuxer->live_timestamp_base = get_user_time( demuxer->ctx->start_time, AV_TIME_BASE_Q );
++        demuxer->hls_timestamp_base = get_user_time( demuxer->ctx->start_time, AV_TIME_BASE_Q );
+     }
+     if (!(demuxer->streams = calloc( demuxer->ctx->nb_streams, sizeof(*demuxer->streams) ))) goto failed;
+     if (demuxer_create_streams( demuxer )) goto failed;
+@@ -1346,7 +1348,7 @@
+     sample->pts = get_stream_time( stream, packet->pts );
+     sample->dts = get_stream_time( stream, packet->dts );
+     sample->duration = get_stream_time( stream, packet->duration );
+-    normalize_live_hls_timestamps( demuxer, sample );
++    normalize_hls_timestamps( demuxer, sample );
+     fixup_asf_mpeg4_timestamps( demuxer->ctx, stream, demuxer_stream, sample );
+     if (demuxer->ctx->iformat && strstr( demuxer->ctx->iformat->name, "asf" ))
+         normalize_stream_timestamps( demuxer_stream, sample );
+@@ -1387,6 +1389,10 @@
+ 
+     if (!demuxer_is_seekable( demuxer )) return STATUS_NOT_SUPPORTED;
+ 
++    /* avformat_seek_file expects source timestamps, not MF-relative positions. */
++    if (demuxer->hls_timestamp_base != AV_NOPTS_VALUE)
++        timestamp = av_sat_add64( timestamp, av_rescale( demuxer->hls_timestamp_base, AV_TIME_BASE, 10000000 ) );
++
+     if (!(status = raw_mpegvideo_seek( demuxer, params->timestamp )))
+         goto done;
+     if (status != STATUS_NOT_SUPPORTED)

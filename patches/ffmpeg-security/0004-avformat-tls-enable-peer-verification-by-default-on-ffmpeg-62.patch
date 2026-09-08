@@ -1,0 +1,28 @@
+From 8db766d029d2ab52f3a4e98bb2bcfbe438586bf4 Mon Sep 17 00:00:00 2001
+From: RTSP-on-GE11 contributors <noreply@invalid>
+Date: Wed, 15 Jul 2026 12:00:00 -0500
+Subject: [PATCH 4/4] avformat/tls: enable peer verification by default on
+ FFmpeg 62
+
+Upstream commit 5621eee672391680f432075865e7580189ad0097 introduced FF_API_NO_DEFAULT_TLS_VERIFY and scheduled the default change for the next libavformat major version. Upstream commit 9549c9ad79ee399ff469a420223d4b6118498f7e completed that change in version 63.
+
+This project keeps the pinned version 62 ABI, so disable only that compatibility gate. The existing TLS_VERIFY_DEFAULT branch consequently becomes 1 for every TLS client option while callers retain the explicit opt-out.
+
+This is project-authored security hardening, not an unmodified upstream commit or a CVE backport.
+---
+ libavformat/version_major.h | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/libavformat/version_major.h b/libavformat/version_major.h
+index c2f6e16..6210926 100644
+--- a/libavformat/version_major.h
++++ b/libavformat/version_major.h
+@@ -45,7 +45,7 @@
+ 
+ #define FF_API_INTERNAL_TIMING          (LIBAVFORMAT_VERSION_MAJOR < 63)
+ 
+-#define FF_API_NO_DEFAULT_TLS_VERIFY    (LIBAVFORMAT_VERSION_MAJOR < 63)
++#define FF_API_NO_DEFAULT_TLS_VERIFY    0
+ 
+ #define FF_API_R_FRAME_RATE            1
+ 

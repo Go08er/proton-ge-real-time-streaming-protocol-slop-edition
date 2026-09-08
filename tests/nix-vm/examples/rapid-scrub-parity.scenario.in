@@ -1,0 +1,34 @@
+# SPDX-License-Identifier: BSD-3-Clause
+load "http://127.0.0.1:18765/media?case=rapid-scrub-parity"
+wait_event CANPLAY 15000
+play
+wait_event PLAYING 5000
+# Give the transport oracle an early request-relative playback observation
+# before the longer pre-scrub anchor.
+wait_time @STARTUP_WAIT@ 5000
+wait_time @INITIAL_WAIT@ 20000
+snapshot "rapid-scrub-pre"
+
+# Keep this entire dispatch burst below the candidate's 250 ms trailing
+# debounce. Proton-RTSP should commit the leading target immediately, retain
+# only the newest target while that seek is in flight, and then commit the
+# final target. A pure trailing debounce commits only the final target.
+seek @SCRUB_1@
+seek @SCRUB_2@
+seek @SCRUB_3@
+seek @SCRUB_4@
+seek @SCRUB_5@
+seek @SCRUB_6@
+seek @SCRUB_7@
+seek @SCRUB_8@
+
+# Do not consume a particular SEEKED event here: the reference behavior emits
+# at least two while the trailing-debounce behavior emits one. Instead, prove
+# that both implementations eventually become idle at the final target.
+wait_seek_settled @SCRUB_8@ 0.500 20000
+snapshot "rapid-scrub-settled"
+wait_time @FINAL_WAIT@ 15000
+snapshot "rapid-scrub-post-settle"
+wait_ms 1000
+snapshot "rapid-scrub-post-settle"
+shutdown

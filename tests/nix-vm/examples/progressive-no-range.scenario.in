@@ -1,0 +1,16 @@
+# SPDX-License-Identifier: BSD-3-Clause
+# A no-Range origin must remain progressive and sequential.  The far seek is
+# deliberately not followed by SEEKED.  Hold for real wall-clock time because
+# wait_time would return immediately if the public clock falsely jumped to the
+# far target; success means the unsupported request was ignored without moving
+# the clock or poisoning the active linear stream.
+load "http://127.0.0.1:18765/media?case=progressive-no-range"
+wait_event CANPLAY 15000
+play
+wait_event PLAYING 5000
+wait_time @STARTUP_WAIT@ 5000
+wait_time @INITIAL_WAIT@ 20000
+seek @UNSUPPORTED_SEEK@
+wait_ms @RECOVERY_HOLD_MS@
+snapshot "no-range-sequential"
+shutdown

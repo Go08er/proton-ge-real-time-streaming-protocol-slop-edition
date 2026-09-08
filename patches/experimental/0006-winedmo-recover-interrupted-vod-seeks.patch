@@ -1,0 +1,302 @@
+From 0ad1d95d922852dcc5b240b9de38fa34d6502bc4 Mon Sep 17 00:00:00 2001
+From: RTSP-on-GE11 contributors <noreply@invalid>
+Date: Wed, 15 Jul 2026 21:19:36 -0500
+Subject: [PATCH 6/6] winedmo, mfmediaengine: recover interrupted VOD seeks
+
+Coalesce MediaEngine seek completion safely, cancel deferred work at shutdown,
+and retain an aggregate emergency packet-queue bound while priming A/V
+streams.
+
+Treat a deliberately interrupted progressive HTTP read as cancellation even
+when FFmpeg returns a positive partial packet, then clear only the latched
+AVERROR_EXIT during the following range seek. If any seek transition fails,
+stop the producer and report one terminal Media Foundation error instead of
+retrying a damaged timeline. Restore FFmpeg log-level filtering before
+formatting diagnostic output.
+---
+ dlls/mfmediaengine/main.c   | 36 +++++++++++++++++++++++++++++++-----
+ dlls/winedmo/media_source.c | 25 ++++++++++++++-----------
+ dlls/winedmo/unix_demuxer.c | 35 +++++++++++++++++++++++++++++++++++
+ dlls/winedmo/unixlib.c      |  2 ++
+ 4 files changed, 82 insertions(+), 16 deletions(-)
+
+diff --git a/dlls/mfmediaengine/main.c b/dlls/mfmediaengine/main.c
+index 19a9ad8..04b10c1 100644
+--- a/dlls/mfmediaengine/main.c
++++ b/dlls/mfmediaengine/main.c
+@@ -178,6 +178,7 @@ struct media_engine
+     double default_playback_rate;
+     BOOL playback_requested;
+     BOOL deferred_seek_work_scheduled;
++    MFWORKITEM_KEY deferred_seek_work_key;
+     double volume;
+     double duration;
+     double current_seek;
+@@ -1106,19 +1107,19 @@ static HRESULT WINAPI media_engine_session_events_Invoke(IMFAsyncCallback *iface
+             EnterCriticalSection(&engine->cs);
+             if (engine->flags & FLAGS_ENGINE_SEEKING)
+             {
+-                double next_seek = engine->next_seek;
++                BOOL deferred_seek_pending = engine->flags & FLAGS_ENGINE_DEFERRED_SEEK;
++                double next_seek = deferred_seek_pending ? NAN : engine->next_seek;
+                 double current_seek = engine->current_seek;
+ 
+                 engine->current_seek = NAN;
+                 engine->next_seek = NAN;
+-                engine->deferred_seek = NAN;
+                 media_engine_set_flag(engine, FLAGS_ENGINE_SEEKING | FLAGS_ENGINE_IS_ENDED, FALSE);
+-                media_engine_set_flag(engine, FLAGS_ENGINE_DEFERRED_SEEK, FALSE);
+                 IMFMediaEngineNotify_EventNotify(engine->callback, MF_MEDIA_ENGINE_EVENT_SEEKED, 0, 0);
+                 IMFMediaEngineNotify_EventNotify(engine->callback, MF_MEDIA_ENGINE_EVENT_TIMEUPDATE, 0, 0);
+                 if (isfinite(next_seek) && (!isfinite(current_seek) || fabs(next_seek - current_seek) > 0.001))
+                     media_engine_set_current_time(engine, next_seek);
+-                else if (!(engine->flags & (FLAGS_ENGINE_PAUSED | FLAGS_ENGINE_PAUSE_PENDING | FLAGS_ENGINE_SCRUBBING)))
++                else if (!deferred_seek_pending
++                        && !(engine->flags & (FLAGS_ENGINE_PAUSED | FLAGS_ENGINE_PAUSE_PENDING | FLAGS_ENGINE_SCRUBBING)))
+                     restart_playback = TRUE;
+             }
+ 
+@@ -2520,11 +2521,14 @@ static HRESULT media_engine_schedule_deferred_seek(struct media_engine *engine,
+ 
+     if (!delay)
+         delay = 1;
+-    hr = MFScheduleWorkItem(&engine->deferred_seek_callback, NULL, -(INT64)delay, NULL);
++    engine->deferred_seek_work_key = 0;
++    hr = MFScheduleWorkItem(&engine->deferred_seek_callback, NULL, -(INT64)delay,
++            &engine->deferred_seek_work_key);
+     if (SUCCEEDED(hr))
+         engine->deferred_seek_work_scheduled = TRUE;
+     else
+     {
++        engine->deferred_seek_work_key = 0;
+         WARN("Failed to schedule deferred seek, hr %#lx; flushing synchronously.\n", hr);
+         hr = media_engine_flush_deferred_seek(engine);
+     }
+@@ -2552,6 +2556,7 @@ static HRESULT WINAPI media_engine_deferred_seek_callback_Invoke(IMFAsyncCallbac
+ 
+     EnterCriticalSection(&engine->cs);
+     engine->deferred_seek_work_scheduled = FALSE;
++    engine->deferred_seek_work_key = 0;
+ 
+     if (!(engine->flags & FLAGS_ENGINE_SHUT_DOWN) && (engine->flags & FLAGS_ENGINE_DEFERRED_SEEK))
+     {
+@@ -2624,7 +2629,11 @@ static HRESULT media_engine_defer_current_time(struct media_engine *engine, doub
+     }
+ 
+     if (engine->flags & FLAGS_ENGINE_PAUSED)
++    {
++        engine->deferred_seek = NAN;
++        media_engine_set_flag(engine, FLAGS_ENGINE_DEFERRED_SEEK, FALSE);
+         return media_engine_set_current_time(engine, seektime);
++    }
+ 
+     if ((engine->flags & FLAGS_ENGINE_DEFERRED_SEEK) && fabs(engine->deferred_seek - seektime) <= 0.001)
+         return S_OK;
+@@ -2650,7 +2659,11 @@ static HRESULT WINAPI media_engine_SetCurrentTime(IMFMediaEngineEx *iface, doubl
+     if (engine->flags & FLAGS_ENGINE_SHUT_DOWN)
+         hr = MF_E_SHUTDOWN;
+     else
++    {
++        engine->deferred_seek = NAN;
++        media_engine_set_flag(engine, FLAGS_ENGINE_DEFERRED_SEEK, FALSE);
+         hr = media_engine_set_current_time(engine, time);
++    }
+ 
+     LeaveCriticalSection(&engine->cs);
+ 
+@@ -3121,6 +3134,8 @@ static HRESULT WINAPI media_engine_GetVideoAspectRatio(IMFMediaEngineEx *iface,
+ static HRESULT WINAPI media_engine_Shutdown(IMFMediaEngineEx *iface)
+ {
+     struct media_engine *engine = impl_from_IMFMediaEngineEx(iface);
++    MFWORKITEM_KEY deferred_seek_work_key = 0;
++    BOOL cancel_deferred_seek_work = FALSE;
+     HRESULT hr = S_OK;
+ 
+     TRACE("%p.\n", iface);
+@@ -3131,10 +3146,21 @@ static HRESULT WINAPI media_engine_Shutdown(IMFMediaEngineEx *iface)
+     else
+     {
+         media_engine_set_flag(engine, FLAGS_ENGINE_SHUT_DOWN, TRUE);
++        if (engine->deferred_seek_work_scheduled)
++        {
++            deferred_seek_work_key = engine->deferred_seek_work_key;
++            cancel_deferred_seek_work = TRUE;
++            engine->deferred_seek_work_scheduled = FALSE;
++            engine->deferred_seek_work_key = 0;
++        }
++        engine->deferred_seek = NAN;
++        media_engine_set_flag(engine, FLAGS_ENGINE_DEFERRED_SEEK, FALSE);
+         media_engine_clear_presentation(engine);
+         /* critical section can not be held during shutdown, as shut down requires all pending
+          * callbacks to complete, and some callbacks require this cs */
+         LeaveCriticalSection(&engine->cs);
++        if (cancel_deferred_seek_work)
++            MFCancelWorkItem(deferred_seek_work_key);
+         IMFMediaSession_Shutdown(engine->session);
+         EnterCriticalSection(&engine->cs);
+     }
+diff --git a/dlls/winedmo/media_source.c b/dlls/winedmo/media_source.c
+index da773ff..46f8f3a 100644
+--- a/dlls/winedmo/media_source.c
++++ b/dlls/winedmo/media_source.c
+@@ -249,6 +249,8 @@ static void media_packet_free(struct media_packet *pkt)
+ 
+ #define MEDIA_SOURCE_MAX_QUEUED_PACKETS 8
+ #define MEDIA_SOURCE_MAX_QUEUED_BYTES   (8 * 1024 * 1024)
++#define MEDIA_SOURCE_EMERGENCY_QUEUED_PACKETS 1024
++#define MEDIA_SOURCE_EMERGENCY_QUEUED_BYTES   (64 * 1024 * 1024)
+ 
+ struct media_stream;
+ 
+@@ -478,6 +480,8 @@ static BOOL media_source_stream_queues_full(struct media_source *source)
+     BOOL any_active = FALSE;
+     BOOL primed = TRUE;
+     BOOL any_full = FALSE;
++    UINT64 queued_packets = 0;
++    UINT64 queued_bytes = 0;
+ 
+     for (i = 0; i < source->stream_count; ++i)
+     {
+@@ -495,6 +499,8 @@ static BOOL media_source_stream_queues_full(struct media_source *source)
+         empty = !stream->queued_packets;
+         full = stream->queued_packets >= MEDIA_SOURCE_MAX_QUEUED_PACKETS
+                 || stream->queued_bytes >= MEDIA_SOURCE_MAX_QUEUED_BYTES;
++        queued_packets += stream->queued_packets;
++        queued_bytes += stream->queued_bytes;
+         LeaveCriticalSection(&stream->queue_cs);
+ 
+         if (empty)
+@@ -503,7 +509,8 @@ static BOOL media_source_stream_queues_full(struct media_source *source)
+             any_full = TRUE;
+     }
+ 
+-    return !any_active || (primed && any_full);
++    return !any_active || queued_packets >= MEDIA_SOURCE_EMERGENCY_QUEUED_PACKETS
++            || queued_bytes >= MEDIA_SOURCE_EMERGENCY_QUEUED_BYTES || (primed && any_full);
+ }
+ 
+ /* ========================================================================
+@@ -1009,7 +1016,6 @@ static HRESULT media_source_start(struct media_source *source, IMFPresentationD
+         GUID *format, PROPVARIANT *position)
+ {
+     BOOL starting = source->state == SOURCE_STOPPED, seek_message;
+-    BOOL cancel_transition_failed = FALSE;
+     IMFStreamDescriptor **descriptors;
+     NTSTATUS status = STATUS_SUCCESS;
+     DWORD i, count;
+@@ -1093,22 +1099,19 @@ static HRESULT media_source_start(struct media_source *source, IMFPresentationD
+         }
+ 
+         WARN("MF media source seek to %s.\n", debugstr_time(position->hVal.QuadPart));
+-        if ((status = winedmo_demuxer_set_cancelled(source->demuxer, TRUE)))
+-            cancel_transition_failed = TRUE;
+-        else
++        if (!(status = winedmo_demuxer_set_cancelled(source->demuxer, TRUE)))
+         {
+             EnterCriticalSection(&source->demuxer_cs);
+-            if ((status = winedmo_demuxer_set_cancelled(source->demuxer, FALSE)))
+-                cancel_transition_failed = TRUE;
+-            else
++            if (!(status = winedmo_demuxer_set_cancelled(source->demuxer, FALSE)))
+                 status = winedmo_demuxer_seek(source->demuxer, position->hVal.QuadPart);
+             LeaveCriticalSection(&source->demuxer_cs);
+         }
+ 
+-        if (cancel_transition_failed)
++        if (status)
+         {
+-            /* Cancellation state is now unknown.  Keep the epoch odd and stop
+-             * the demux producer instead of turning every later read into EOF. */
++            /* Cancellation or seek failed after the old queues were flushed.
++             * Keep the epoch odd and stop the producer rather than retrying an
++             * unknown or damaged timeline. */
+             source->demux_thread_shutdown = true;
+             source->demux_terminal_error = HRESULT_FROM_NT(status);
+             for (i = 0; i < source->stream_count; i++)
+diff --git a/dlls/winedmo/unix_demuxer.c b/dlls/winedmo/unix_demuxer.c
+index 5e98c0a..bc17071 100644
+--- a/dlls/winedmo/unix_demuxer.c
++++ b/dlls/winedmo/unix_demuxer.c
+@@ -70,6 +70,7 @@ struct demuxer
+     INT64 duration;
+     BOOL direct_url;
+     BOOL require_avio_seek;
++    BOOL cancelled_read_pending_recovery;
+     INT64 io_timeout;
+     int cancelled;
+     INT64 deadline;
+@@ -1170,6 +1171,15 @@ static NTSTATUS demuxer_filter_packet( struct demuxer *demuxer, AVPacket **packe
+     struct stream *stream;
+     int i, ret;
+ 
++    if (demuxer->cancelled_read_pending_recovery) return STATUS_CANCELLED;
++    if (demuxer->require_avio_seek
++            && __atomic_load_n( &demuxer->cancelled, __ATOMIC_ACQUIRE )
++            && demuxer->ctx->pb && demuxer->ctx->pb->error == AVERROR_EXIT)
++    {
++        demuxer->cancelled_read_pending_recovery = TRUE;
++        return STATUS_CANCELLED;
++    }
++
+     do
+     {
+         if ((*packet = demuxer->last_packet)) return STATUS_SUCCESS;
+@@ -1190,6 +1200,15 @@ static NTSTATUS demuxer_filter_packet( struct demuxer *demuxer, AVPacket **packe
+             if (demuxer->io_timeout) demuxer_set_deadline( demuxer, demuxer->io_timeout );
+             ret = av_read_frame( demuxer->ctx, *packet );
+             if (demuxer->io_timeout) demuxer_set_deadline( demuxer, 0 );
++            if (demuxer->require_avio_seek
++                    && __atomic_load_n( &demuxer->cancelled, __ATOMIC_ACQUIRE )
++                    && (ret == AVERROR_EXIT || (demuxer->ctx->pb
++                    && demuxer->ctx->pb->error == AVERROR_EXIT)))
++            {
++                demuxer->cancelled_read_pending_recovery = TRUE;
++                av_packet_free( packet );
++                return STATUS_CANCELLED;
++            }
+             if (!ret)
+             {
+                 stream = demuxer->streams + (*packet)->stream_index;
+@@ -1302,6 +1321,21 @@ NTSTATUS demuxer_seek( void *arg )
+     if (status != STATUS_NOT_SUPPORTED)
+         return status;
+ 
++    if (demuxer->require_avio_seek && demuxer->cancelled_read_pending_recovery && demuxer->ctx->pb)
++    {
++        AVIOContext *pb = demuxer->ctx->pb;
++
++        if (pb->error == AVERROR_EXIT)
++        {
++            pb->error = 0;
++            pb->eof_reached = 0;
++        }
++        else if (!pb->error)
++        {
++            pb->eof_reached = 0;
++        }
++    }
++
+     if (demuxer->io_timeout) demuxer_set_deadline( demuxer, demuxer->io_timeout );
+     ret = avformat_seek_file( demuxer->ctx, -1, INT64_MIN, timestamp, timestamp, AVSEEK_FLAG_BACKWARD );
+     if (demuxer->io_timeout) demuxer_set_deadline( demuxer, 0 );
+@@ -1310,6 +1344,7 @@ NTSTATUS demuxer_seek( void *arg )
+         ERR( "Failed to seek demuxer %p, error %s.\n", demuxer, debugstr_averr(ret) );
+         return STATUS_UNSUCCESSFUL;
+     }
++    demuxer->cancelled_read_pending_recovery = FALSE;
+ 
+ done:
+     for (i = 0; i < demuxer->ctx->nb_streams; i++)
+diff --git a/dlls/winedmo/unixlib.c b/dlls/winedmo/unixlib.c
+index 1e4d92b..23dcd3b 100644
+--- a/dlls/winedmo/unixlib.c
++++ b/dlls/winedmo/unixlib.c
+@@ -130,6 +130,8 @@ static void vlog( void *ctx, int level, const char *fmt, va_list va_args )
+     char *p;
+     int prefix = 1;
+ 
++    if (level > av_log_get_level()) return;
++
+     if (level <= AV_LOG_ERROR) dbcl = __WINE_DBCL_ERR;
+     if (level <= AV_LOG_WARNING) dbcl = __WINE_DBCL_WARN;
+ 

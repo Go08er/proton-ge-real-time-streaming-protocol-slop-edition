@@ -1,0 +1,46 @@
+From: RTSP-on-GE11 contributors <noreply@invalid>
+Subject: [PROPOSED] mf: defer sink demand until seek sources restart
+
+Review overlay against the final A3.19 Wine tree, not an integrated patch.
+If accepted, fold this correction into patch 0007 in a fresh candidate;
+the A3.19 pin, series, sources, and installed artifact remain unchanged.
+
+Running sinks can request another sample while a seek has stopped the
+sources and cleared transform demand. WineDMO correctly rejects an inactive
+stream's RequestSample(), but the synchronous transform retains its output
+request. Later demand sees had_requests and does not restart the pull chain,
+including the existing seek-completion re-prime.
+
+Keep the sink's request credit without pulling upstream during the two
+source-restart phases. Once every source and selected stream has started,
+the existing patch 0007 barrier clears SESSION_FLAG_RESTARTING and re-primes
+one request per sink. No timer, retry, extra demand, or timeout change is
+introduced. Qualify the flag with STARTING_SOURCES so a flag left behind by
+a failed start cannot block demand in unrelated session phases.
+
+This closes a source-demonstrable synchronous pull-chain race. The live
+episode #331 wrong-state warnings are supporting correlation, not proof
+that this is the only cause of its seek stalls. Model tests are not a
+Wine runtime or playback result; native/contained and in-game validation
+remain required before claiming a fix.
+
+The license of the modified Wine source file applies to this patch.
+---
+diff --git a/dlls/mf/session.c b/dlls/mf/session.c
+--- a/dlls/mf/session.c
++++ b/dlls/mf/session.c
+@@ -4351,6 +4351,14 @@ static void session_request_sample(struct media_session *session, IMFStreamSink *sink_stream)
+     }
+ 
+     sink_node->u.sink.requests++;
++    /* Keep sink demand while stopped seek sources restart. Pulling now can
++     * leave a transform request stranded after MF_E_MEDIA_SOURCE_WRONGSTATE.
++     * The all-sources-started barrier clears RESTARTING before re-priming. */
++    if (session->command_state == COMMAND_STATE_RESTARTING_SOURCES
++            || (session->command_state == COMMAND_STATE_STARTING_SOURCES
++                && (session->presentation.flags & SESSION_FLAG_RESTARTING)))
++        return;
++
+     if (FAILED(session_request_sample_from_node(session, up_node, output)))
+         sink_node->u.sink.requests--;
+ }

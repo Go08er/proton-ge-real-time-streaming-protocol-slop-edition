@@ -1,0 +1,12 @@
+# SPDX-License-Identifier: BSD-3-Clause
+load "http://127.0.0.1:@PORT@/mux/index.m3u8"
+wait_event CANPLAY 30000
+play
+wait_event PLAYING 15000
+
+# Eight one-second samples span multiple two-second playlist generations.
+loop 8
+wait_ms 1000
+snapshot "live-steady"
+endloop
+shutdown

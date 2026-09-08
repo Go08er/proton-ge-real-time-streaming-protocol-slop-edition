@@ -1,0 +1,41 @@
+diff --git a/proton b/proton
+index 3904a4e..9148211 100755
+--- a/proton
++++ b/proton
+@@ -1741,6 +1741,17 @@ class Session:
+                 "winebth.sys": "d", #disable winebth.sys as it crashes winedevice.exe
+         }
+ 
++        self.xr_mode = self.env.get("PROTON_XR_MODE", "auto").strip().lower()
++        if self.xr_mode not in ("auto", "xrizer"):
++            log("Unsupported PROTON_XR_MODE '%s'; falling back to auto." % self.xr_mode)
++            self.xr_mode = "auto"
++
++        # XRizer implements Windows OpenVR on the native OpenXR runtime.  In
++        # this explicit mode, keep WineOpenXR from opening that runtime too.
++        # The default remains unchanged for every other XR arrangement.
++        if self.xr_mode == "xrizer":
++            self.dlloverrides["wineopenxr"] = "d"
++
+         # CW Bug 21737. Locoland executable happens to be steam.exe.
+         if os.environ.get("SteamGameId", 0) == "352130":
+             del self.dlloverrides["steam.exe"]
+@@ -2396,6 +2407,7 @@ class Session:
+                     self.log_file.write("SteamGameId: " + self.env["SteamGameId"] + "\n")
+                 self.log_file.write("Command: " + str(sys.argv[2:] + self.cmdlineappend) + "\n")
+                 self.log_file.write("Options: " + str(self.compat_config) + "\n")
++                self.log_file.write("XR mode: " + self.xr_mode + "\n")
+ 
+                 self.try_log_slr_versions()
+ 
+@@ -2496,6 +2508,10 @@ class Session:
+             else:
+                 s = dll + "=" + setting
+         append_to_env_str(self.env, "WINEDLLOVERRIDES", s, ";")
++        if self.log_file:
++            self.log_file.write("Final WINEDLLOVERRIDES: " + self.env["WINEDLLOVERRIDES"] + "\n")
++            self.log_file.flush()
++
+ 
+         if platform.machine() == 'aarch64':
+             if os.environ.get("SteamGameId", 0) == "1167630": # Teardown

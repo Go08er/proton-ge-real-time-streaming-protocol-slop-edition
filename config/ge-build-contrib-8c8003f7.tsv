@@ -1,0 +1,37 @@
+build_contrib_manifest_version	3
+source_commit	8c8003f7f5473d883fbe1bc7ac070c79955754e8
+entry	contrib/wine-gecko-2.47.4-x86.tar.xz	0644	43025064	2cfc8d5c948602e21eff8a78613e1826f2d033df9672cace87fed56e8310afb6
+fetch	contrib/wine-gecko-2.47.4-x86.tar.xz	https://dl.winehq.org/wine/wine-gecko/2.47.4/wine-gecko-2.47.4-x86.tar.xz
+entry	contrib/wine-gecko-2.47.4-x86_64.tar.xz	0644	41935496	fd88fc7e537d058d7a8abf0c1ebc90c574892a466de86706a26d254710a82814
+fetch	contrib/wine-gecko-2.47.4-x86_64.tar.xz	https://dl.winehq.org/wine/wine-gecko/2.47.4/wine-gecko-2.47.4-x86_64.tar.xz
+entry	contrib/wine-mono-11.2.0-x86.tar.xz	0644	39415892	c9fb2e2823acf30b000b8806177db0f40751786136dd3f8fb2be7897b1643d06
+fetch	contrib/wine-mono-11.2.0-x86.tar.xz	https://github.com/madewokherd/wine-mono/releases/download/wine-mono-11.2.0/wine-mono-11.2.0-x86.tar.xz
+entry	contrib/xalia-0.4.9-net48-mono.zip	0644	2230466	e2c94a40f68f63660cc06405a641bc4e5a2e9b9320b9608e01a21feb6f6709c5
+fetch	contrib/xalia-0.4.9-net48-mono.zip	https://github.com/madewokherd/xalia/releases/download/xalia-0.4.9/xalia-0.4.9-net48-mono.zip
+entry	contrib/xrandr-1.5.4.tar.xz	0644	182784	2cafccb2aaf2491a4068676117a0d4f90ab307724b96fffc54cd1da953779400
+fetch	contrib/xrandr-1.5.4.tar.xz	https://www.x.org/releases/individual/app/xrandr-1.5.4.tar.xz
+# GE-Proton11-3 additions relative to the bb1caad3 snapshot:
+entry	contrib/protonfixes/downloads/unzip/unzip_6.0.orig.tar.gz	0644	1376845	036d96991646d0449ed0aa952e4fbe21b476ce994abc276e49d30e686708bd37
+fetch	contrib/protonfixes/downloads/unzip/unzip_6.0.orig.tar.gz	https://deb.debian.org/debian/pool/main/u/unzip/unzip_6.0.orig.tar.gz
+entry	contrib/protonfixes/downloads/unzip/unzip_6.0-29.debian.tar.xz	0644	25876	14043e5ea351c02b3bc8676e1e6d20d79b9a690b6d7520e8138ac629cc048417
+fetch	contrib/protonfixes/downloads/unzip/unzip_6.0-29.debian.tar.xz	https://deb.debian.org/debian/pool/main/u/unzip/unzip_6.0-29.debian.tar.xz
+# GE-Proton11-3 redist additions relative to the bb1caad3 snapshot.
+# Piper's top-level ExternalProject dependencies:
+entry	contrib/piper/downloads/fmt/10.0.0.zip	0644	920667	5bf4d5358301fdf3bd100c01b9d4c1fbb2091dc2267fb4fa6d7cd522b3e47179
+fetch	contrib/piper/downloads/fmt/10.0.0.zip	https://github.com/fmtlib/fmt/archive/refs/tags/10.0.0.zip
+entry	contrib/piper/downloads/spdlog/v1.12.0.zip	0644	331280	6174bf8885287422a6c6a0312eb8a30e8d22bcfcee7c48a6d02d1835d7769232
+fetch	contrib/piper/downloads/spdlog/v1.12.0.zip	https://github.com/gabime/spdlog/archive/refs/tags/v1.12.0.zip
+# This piper-phonemize input is branch-derived. The observed archive peeled to
+# 5ecbb9b59abcffe03a9775ae82491c9ac5037f4d; refresh this record if pic moves.
+entry	contrib/piper/downloads/piper-phonemize/pic.zip	0644	9800149	728800cd310c64e6b6877866161b32ff0dc2d9c52ebdc54281fa21e448d2adef
+fetch	contrib/piper/downloads/piper-phonemize/pic.zip	https://github.com/shaunren/piper-phonemize/archive/refs/heads/pic.zip
+# Downloads reached while configuring/building that observed piper-phonemize archive:
+entry	contrib/piper/downloads/piper-phonemize/onnxruntime/onnxruntime-linux-x64-1.14.1.tgz	0644	6233648	010585f534d822bf02d54c7cfc53b57aa3eb0cf34f8fb7503ee519ed18e25d29
+fetch	contrib/piper/downloads/piper-phonemize/onnxruntime/onnxruntime-linux-x64-1.14.1.tgz	https://github.com/microsoft/onnxruntime/releases/download/v1.14.1/onnxruntime-linux-x64-1.14.1.tgz
+entry	contrib/piper/downloads/piper-phonemize/espeak-ng/0f65aa301e0d6bae5e172cc74197d32a6182200f.zip	0644	18003706	150fc955926a084a77ebe25c9e8287bde2e2a17bbf9b23a25c147b556837949f
+fetch	contrib/piper/downloads/piper-phonemize/espeak-ng/0f65aa301e0d6bae5e172cc74197d32a6182200f.zip	https://github.com/rhasspy/espeak-ng/archive/0f65aa301e0d6bae5e172cc74197d32a6182200f.zip
+entry	contrib/piper/downloads/piper-phonemize/espeak-ng/sonic/fbf75c3d6d846bad3bb3d456cbc5d07d9fd8c104.zip	0644	5343518	d7c5a715f574a4a2a5afe970f489d3950bcd5229f1bed3f0e010a5413957ec20
+fetch	contrib/piper/downloads/piper-phonemize/espeak-ng/sonic/fbf75c3d6d846bad3bb3d456cbc5d07d9fd8c104.zip	https://github.com/waywardgeek/sonic/archive/fbf75c3d6d846bad3bb3d456cbc5d07d9fd8c104.zip
+# SteamRT4 ProtonFixes all/install dependency:
+entry	contrib/protonfixes/zenity-rs/zenity-rs	0644	1714624	797bd492a8723d741d888320ab87b934b0c4571a1ff2c128963a08daa35df8c7
+fetch	contrib/protonfixes/zenity-rs/zenity-rs	https://github.com/QaidVoid/zenity-rs/releases/download/v0.2.8/zenity-rs-x86_64-linux

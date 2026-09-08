@@ -1,0 +1,29 @@
+# SPDX-License-Identifier: BSD-3-Clause
+# Targets are substituted by stress-case.nix and checked against ffprobe.
+load "http://127.0.0.1:18765/media?case=vod-seek"
+wait_event CANPLAY 15000
+play
+wait_event PLAYING 5000
+# Establish progressive startup promptly, then keep playing continuously to
+# the longer absolute pre-seek checkpoint below.
+wait_time @STARTUP_WAIT@ 5000
+wait_time @INITIAL_WAIT@ 20000
+
+loop 4
+seek @FORWARD_SEEK@
+wait_event SEEKED 5000
+wait_time @FORWARD_WAIT@ 5000
+snapshot "post-seek-steady"
+seek @BACKWARD_SEEK@
+wait_event SEEKED 5000
+wait_time @BACKWARD_WAIT@ 5000
+snapshot "post-seek-steady"
+endloop
+
+pause
+wait_event PAUSE 5000
+wait_ms 500
+snapshot "paused-hold"
+play
+wait_event PLAYING 5000
+shutdown

@@ -1,0 +1,60 @@
+From: RTSP-on-GE11 contributors <noreply@invalid>
+Subject: [PATCH] mfmediaengine: preserve a newly selected frame's tick result
+
+A3.20: integrated after GE-Proton11-6 and the project seek/error patches.
+Historical A3.19 inputs and installed artifacts remain unchanged.
+
+GE's ge-video-rework/0015 changed sample_get_pts() to expose future PTS and
+assigned its result to the enclosing loop's hr. A due frame followed by a
+future frame therefore selects the due presentation sample but reports
+S_FALSE and the future PTS to OnVideoStreamTick(). Discarding a trailing
+preroll sample can likewise overwrite a successful selection with S_FALSE.
+
+Preserve S_OK and the PTS of a frame selected during this call, unless a
+later sample produces an actual failure. Do not report an old presentation
+sample just because preroll was discarded. Keep future-only results,
+preroll filtering, errors, queue mutations and sample requests unchanged.
+
+This corrects the function's explicit selected-frame contract. Its cause
+and effect are source-demonstrable; association with WaterWolf choppiness or
+episode #331 seek stalls is NOT established. A subsequent tick can already
+recover an unpresented frame, so this is not proof of a permanent stall.
+The accompanying Python model is not execution of Wine C or a playback test.
+
+The license of the modified Wine source file applies to this patch.
+---
+diff --git a/dlls/mfmediaengine/video_frame_sink.c b/dlls/mfmediaengine/video_frame_sink.c
+--- a/dlls/mfmediaengine/video_frame_sink.c
++++ b/dlls/mfmediaengine/video_frame_sink.c
+@@ -1315,7 +1315,7 @@ HRESULT video_frame_sink_get_pts_after(struct video_frame_sink *sink, MFTIME clocktime, LONGLONG min_pts,
+     if (sink)
+     {
+         IMFSample *sample;
+-        bool transfer_sample = FALSE;
++        bool transfer_sample = FALSE, selected_sample = FALSE;
+         BOOL preroll_sample;
+         EnterCriticalSection(&sink->cs);
+         while (video_frame_sink_sample_queue_pop(sink, &sample))
+@@ -1325,6 +1325,8 @@ HRESULT video_frame_sink_get_pts_after(struct video_frame_sink *sink, MFTIME clocktime, LONGLONG min_pts,
+             {
+                 video_frame_sink_sample_queue_set_presentation(sink, sample);
+                 transfer_sample = TRUE;
++                selected_sample = TRUE;
++                sample_pts = *pts;
+             }
+             else if (preroll_sample)
+             {
+@@ -1348,6 +1350,13 @@ HRESULT video_frame_sink_get_pts_after(struct video_frame_sink *sink, MFTIME clocktime, LONGLONG min_pts,
+                 *pts = sample_pts;
+         }
+ 
++        /* A future or preroll sample must not hide a frame selected above. */
++        if (selected_sample && SUCCEEDED(hr))
++        {
++            hr = S_OK;
++            *pts = sample_pts;
++        }
++
+         LeaveCriticalSection(&sink->cs);
+     }
+ 

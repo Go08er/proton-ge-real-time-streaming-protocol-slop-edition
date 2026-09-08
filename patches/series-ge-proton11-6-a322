@@ -1,0 +1,27 @@
+# Select explicitly for A3.22; patches/series remains the A3.21 control.
+# A3.22 GE-Proton11-6 source candidate. Apply strictly after GE's ge-video-rework.
+# Historical 11-3 inputs remain unchanged in experimental/ and series-ge-proton11-3.
+# Historical A3.20 inputs remain unchanged; use series-ge-proton11-6-a320.
+# Historical A3.19 inputs remain unchanged in ge-proton11-6/ and series-ge-proton11-6-a319.
+ge-proton11-6/0001-winedmo-open-rtsp-over-tcp.patch
+ge-proton11-6/0002-winedmo-interrupt-network-demux-and-report-live-seekability.patch
+ge-proton11-6/0003-winedmo-use-destroy-params-for-wow64-demuxer.patch
+ge-proton11-6/0004-winedmo-async-http-and-repair-vod-seeking.patch
+ge-proton11-6-a322/0005-winedmo-stream-progressive-http-vod.patch
+ge-proton11-6/0006-winedmo-recover-interrupted-vod-seeks.patch
+ge-proton11-6-a320/0007-mf-reprime-and-resume-after-vod-seeks.patch
+ge-proton11-6/0008-winedmo-preserve-audio-timeline-across-flush.patch
+ge-proton11-6/0009-mf-sar-preserve-running-state-across-flush.patch
+ge-proton11-6/0011-mf-fix-initial-presentation-clock-offset.patch
+ge-proton11-6/0013-mfmediaengine-reconcile-pause-scrub-intent.patch
+ge-proton11-6/0014-mfmediaengine-preserve-pending-start-position.patch
+ge-proton11-6/0015-mf-order-immediate-replacement-start.patch
+ge-proton11-6-a320/0017-winedmo-propagate-terminal-network-read-errors.patch
+ge-proton11-6/0018-winewayland-advertise-wine-vr-device-extensions.patch
+ge-proton11-6/0020-quiet-ge-media-diagnostics.patch
+ge-proton11-6-a320/0022-mfmediaengine-preserve-selected-frame-tick-result.patch
+ge-proton11-6-a320/0023-mfmediaengine-check-seekability-before-recovery-reset.patch
+ge-proton11-6/0019-winedmo-trace-bounded-rtsp-drain-state.patch
+
+# Diagnostic-only 0019 remains last and inactive unless rtspdrain is enabled.
+# Source qualification is not build or runtime qualification. PACKAGE_RELEASE=0.

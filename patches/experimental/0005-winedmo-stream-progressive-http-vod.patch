@@ -1,0 +1,439 @@
+From adca5ca2f4a3238624fefa9411968dcb71ae062c Mon Sep 17 00:00:00 2001
+From: RTSP-on-GE11 contributors <noreply@invalid>
+Date: Wed, 15 Jul 2026 14:00:00 -0500
+Subject: [PATCH 5/5] winedmo: stream progressive HTTP VOD through FFmpeg
+
+Ordinary HTTP(S) media currently enters WineDMO only after URLMon finishes a
+cached download. Prefer FFmpeg's direct network I/O so a finite VOD can begin
+while later bytes are still arriving.
+
+Keep GE's explicit HLS route ahead of generic HTTP and classify HLS markers
+only in the URL path, before query or fragment data. Apply cooperative
+interrupt deadlines to direct HTTP open, read, seek, stream-info, and close
+calls. Require a range-seekable AVIO context before advertising seek support
+for generic HTTP without changing HLS/RTSP seekability.
+
+Restrict generic nested protocols to HTTP(S), an explicitly configured HTTP
+proxy, TCP, and TLS. HLS adds only FFmpeg's crypto wrapper for AES-128 segments;
+the nested segment remains constrained by the root-sensitive HTTP(S) list. A
+plain HTTP root may upgrade to HTTPS, but an HTTPS root cannot downgrade to
+plaintext. Force TLS certificate and hostname verification for progressive
+HTTP and the initial HLS playlist. Preserve progressive HTTP trust options
+across redirects and range reopens. HLS child requests require the project's
+companion FFmpeg TLS-default hardening. AES-128 HLS also requires the companion
+GE build-enable patch because the pinned build disables CONFIG_CRYPTO_PROTOCOL.
+
+Return a distinguished, narrowly checked NTSTATUS only when a plain HTTP
+direct open returns AVERROR_INVALIDDATA without timeout or cancellation. In
+the pinned FFmpeg, certificate and hostname failures return AVERROR(EIO), while
+protocol-whitelist and downgrade rejections return AVERROR(EINVAL); both stay
+terminal. Never send an HTTPS input to URLMon. The Windows scheme handler uses
+the narrow signal to attempt the old cached-byte-stream path once. Interrupted
+opens, later demux or media-source failures do not trigger a second transfer,
+and classified HLS never falls back.
+
+Never pass FFmpeg's network AVIO state to Wine's custom-stream MP4 metadata,
+duration-scan, or raw-MPEG seek helpers. Add privacy-safe route markers without
+interpolating the URL. This experimental Alpha patch still requires direct
+HTTP, non-range, fallback, cancellation, source replacement, and VRChat
+lobby-sync tests before release. URLMon fallback is still full-cache and has
+no project timeout. Page URL resolution, including yt-dlp, is intentionally
+out of scope.
+
+The license of the modified Wine source files applies to this patch.
+---
+ dlls/winedmo/media_source.c | 104 +++++++++++++++++++++---------
+ dlls/winedmo/unix_demuxer.c | 125 ++++++++++++++++++++++++++++++++----
+ 2 files changed, 187 insertions(+), 42 deletions(-)
+
+diff --git a/dlls/winedmo/media_source.c b/dlls/winedmo/media_source.c
+index 7db0e6a..7d6e275 100644
+--- a/dlls/winedmo/media_source.c
++++ b/dlls/winedmo/media_source.c
+@@ -3288,64 +3288,107 @@ static HRESULT WINAPI scheme_handler_callback_GetParameters(IMFAsyncCallback *if
+     return E_NOTIMPL;
+ }
+ 
++static BOOL is_http_url(const WCHAR *url)
++{
++    return url && (!wcsnicmp(url, L"http://", 7) || !wcsnicmp(url, L"https://", 8));
++}
++
+ static BOOL is_http_hls_url(const WCHAR *url)
+ {
+     const WCHAR *cursor;
+ 
+-    if (!url || (wcsnicmp(url, L"http://", 7) && wcsnicmp(url, L"https://", 8)))
++    if (!is_http_url(url))
+         return FALSE;
+ 
+-    for (cursor = url; *cursor; cursor++)
++    cursor = url + (!wcsnicmp(url, L"http://", 7) ? 7 : 8);
++    while (*cursor && *cursor != '/' && *cursor != '?' && *cursor != '#')
++        cursor++;
++    if (*cursor != '/')
++        return FALSE;
++
++    for (; *cursor && *cursor != '?' && *cursor != '#'; cursor++)
+         if (!wcsnicmp(cursor, L".m3u8", 5) || !wcsnicmp(cursor, L"/hls_playlist/", 14))
+             return TRUE;
+ 
+     return FALSE;
+ }
+ 
+-static HRESULT WINAPI scheme_handler_callback_Invoke(IMFAsyncCallback *iface, IMFAsyncResult *result)
++static WCHAR *get_http_bytestream_url_hint(WCHAR *url)
++{
++    if (!wcsnicmp(url, L"http://", 7))
++        return url + 7;
++    return url + 8;
++}
++
++static HRESULT cache_http_url(struct object_context *context)
+ {
+-    struct scheme_handler *handler = scheme_handler_from_IMFAsyncCallback(iface);
+-    IUnknown *object, *state = IMFAsyncResult_GetStateNoAddRef(result);
+-    struct object_context *context;
+-    struct result_entry *entry;
+     IMFByteStream *bytestream;
+     QWORD file_size, stream_offset;
+     IStream *stream;
+     DWORD caps;
+     HRESULT hr;
+ 
+-    if (!state || !(context = impl_from_IUnknown(state)))
+-        return E_INVALIDARG;
++    if (FAILED(hr = URLOpenBlockingStreamW(NULL, context->url, &stream, 0, NULL)))
++    {
++        WARN("Failed to cache network media fallback, hr %#lx.\n", hr);
++        return hr;
++    }
++
++    hr = MFCreateMFByteStreamOnStream(stream, &bytestream);
++    IStream_Release(stream);
++    if (FAILED(hr))
++        return hr;
+ 
+-    if (context->url && !is_http_hls_url(context->url)
+-            && (!wcsnicmp(context->url, L"http://", 7)
+-            || !wcsnicmp(context->url, L"https://", 8)))
++    IMFByteStream_Release(context->stream);
++    context->stream = bytestream;
++    context->file_size = -1;
++    context->stream_offset = 0;
++
++    if (SUCCEEDED(IMFByteStream_GetCapabilities(bytestream, &caps))
++            && (caps & MFBYTESTREAM_IS_SEEKABLE)
++            && SUCCEEDED(IMFByteStream_GetLength(bytestream, &file_size))
++            && SUCCEEDED(IMFByteStream_GetCurrentPosition(bytestream, &stream_offset)))
+     {
+-        if (FAILED(hr = URLOpenBlockingStreamW(NULL, context->url, &stream, 0, NULL)))
+-        {
+-            WARN("Failed to open network media, hr %#lx.\n", hr);
+-            goto done;
+-        }
++        context->file_size = file_size;
++        context->stream_offset = stream_offset;
++    }
+ 
+-        hr = MFCreateMFByteStreamOnStream(stream, &bytestream);
+-        IStream_Release(stream);
+-        if (FAILED(hr))
+-            goto done;
++    return S_OK;
++}
+ 
+-        IMFByteStream_Release(context->stream);
+-        context->stream = bytestream;
++static HRESULT WINAPI scheme_handler_callback_Invoke(IMFAsyncCallback *iface, IMFAsyncResult *result)
++{
++    struct scheme_handler *handler = scheme_handler_from_IMFAsyncCallback(iface);
++    IUnknown *object, *state = IMFAsyncResult_GetStateNoAddRef(result);
++    struct object_context *context;
++    struct result_entry *entry;
++    WCHAR *url;
++    HRESULT hr;
+ 
+-        if (SUCCEEDED(IMFByteStream_GetCapabilities(bytestream, &caps))
+-                && (caps & MFBYTESTREAM_IS_SEEKABLE)
+-                && SUCCEEDED(IMFByteStream_GetLength(bytestream, &file_size))
+-                && SUCCEEDED(IMFByteStream_GetCurrentPosition(bytestream, &stream_offset)))
++    if (!state || !(context = impl_from_IUnknown(state)))
++        return E_INVALIDARG;
++
++    if (FAILED(hr = media_source_create(context, (IMFMediaSource **)&object))
++            && is_http_url(context->url) && !is_http_hls_url(context->url)
++            && hr == HRESULT_FROM_NT(STATUS_BAD_NETWORK_PATH))
++    {
++        WARN("media-route=urlmon-cache-fallback reason=direct-open-failure\n");
++        if (SUCCEEDED(hr = cache_http_url(context)))
+         {
+-            context->file_size = file_size;
+-            context->stream_offset = stream_offset;
++            /* Keep the original URL alive for URLMon ownership and diagnostics,
++             * but remove the scheme only for the synchronous cached retry.  The
++             * remaining text preserves a useful extension hint without routing
++             * the retry back into FFmpeg's direct-network branch. */
++            url = context->url;
++            context->url = get_http_bytestream_url_hint(url);
++            hr = media_source_create(context, (IMFMediaSource **)&object);
++            context->url = url;
++            if (SUCCEEDED(hr))
++                TRACE("media-route=urlmon-cache-fallback-opened\n");
+         }
+     }
+ 
+-    if (FAILED(hr = media_source_create(context, (IMFMediaSource **)&object)))
++    if (FAILED(hr))
+         WARN("Failed to create media source, hr %#lx\n", hr);
+     else
+     {
+@@ -3361,7 +3404,6 @@ static HRESULT WINAPI scheme_handler_callback_Invoke(IMFAsyncCallback *iface, IM
+         IUnknown_Release(object);
+     }
+ 
+-done:
+     IMFAsyncResult_SetStatus(context->result, hr);
+     MFInvokeCallback(context->result);
+ 
+diff --git a/dlls/winedmo/unix_demuxer.c b/dlls/winedmo/unix_demuxer.c
+index 9f97138..5e98c0a 100644
+--- a/dlls/winedmo/unix_demuxer.c
++++ b/dlls/winedmo/unix_demuxer.c
+@@ -36,6 +36,12 @@ WINE_DEFAULT_DEBUG_CHANNEL(dmo);
+ #define RTSP_OPEN_TIMEOUT_US INT64_C(30000000)
+ #define RTSP_IO_TIMEOUT_US   INT64_C(15000000)
+ #define HLS_IO_TIMEOUT_US    INT64_C(30000000)
++#define HTTP_OPEN_TIMEOUT_US INT64_C(30000000)
++#define HTTP_IO_TIMEOUT_US   INT64_C(15000000)
++#define HTTP_PROTOCOL_WHITELIST "http,https,httpproxy,tcp,tls"
++#define HTTPS_PROTOCOL_WHITELIST "https,httpproxy,tcp,tls"
++#define HTTP_HLS_PROTOCOL_WHITELIST "http,https,httpproxy,tcp,tls,crypto"
++#define HTTPS_HLS_PROTOCOL_WHITELIST "https,httpproxy,tcp,tls,crypto"
+ 
+ static inline const char *debugstr_averr( int err )
+ {
+@@ -63,6 +69,7 @@ struct demuxer
+     struct stream *streams;
+     INT64 duration;
+     BOOL direct_url;
++    BOOL require_avio_seek;
+     INT64 io_timeout;
+     int cancelled;
+     INT64 deadline;
+@@ -95,8 +102,10 @@ static void demuxer_set_deadline( struct demuxer *demuxer, INT64 timeout )
+ static BOOL demuxer_is_seekable( const struct demuxer *demuxer )
+ {
+     if (demuxer->ctx->ctx_flags & AVFMTCTX_UNSEEKABLE) return FALSE;
+-    if (!demuxer->direct_url && demuxer->ctx->pb &&
+-        !(demuxer->ctx->pb->seekable & AVIO_SEEKABLE_NORMAL)) return FALSE;
++    if (demuxer->require_avio_seek)
++        return demuxer->ctx->pb && (demuxer->ctx->pb->seekable & AVIO_SEEKABLE_NORMAL);
++    if (!demuxer->direct_url && demuxer->ctx->pb
++            && !(demuxer->ctx->pb->seekable & AVIO_SEEKABLE_NORMAL)) return FALSE;
+     return TRUE;
+ }
+ 
+@@ -493,6 +502,7 @@ static NTSTATUS raw_mpegvideo_seek( struct demuxer *demuxer, INT64 timestamp )
+     UINT32 state = 0xffffffff;
+     unsigned int i;
+ 
++    if (demuxer->direct_url) return STATUS_NOT_SUPPORTED;
+     if (!demuxer->ctx->iformat || strcmp( demuxer->ctx->iformat->name, "mpegvideo" ))
+         return STATUS_NOT_SUPPORTED;
+     if (!context || context->length == (UINT64)-1 || demuxer->duration <= 0)
+@@ -593,13 +603,15 @@ static void fixup_asf_vc1_timestamps( const AVFormatContext *ctx, AVStream *avst
+ 
+ }
+ 
+-static INT64 get_context_duration( const AVFormatContext *ctx )
++static INT64 get_context_duration( const AVFormatContext *ctx, BOOL custom_io )
+ {
+     INT64 i, max_duration = AV_NOPTS_VALUE, max_video_duration = AV_NOPTS_VALUE;
+     INT64 duration;
+ 
+     if (ctx->duration_estimation_method == AVFMT_DURATION_FROM_BITRATE)
+     {
++        if (!custom_io) return AV_NOPTS_VALUE;
++
+         duration = get_asf_header_duration( (AVFormatContext *)ctx );
+         if (duration != AV_NOPTS_VALUE)
+             return duration;
+@@ -795,13 +807,42 @@ static void parse_mp4_streams_metadata( struct demuxer *demuxer )
+     unix_seek_callback( context, pos, SEEK_SET );
+ }
+ 
++static BOOL is_http_url( const char *url )
++{
++    return url && (!strncasecmp( url, "http://", 7 ) || !strncasecmp( url, "https://", 8 ));
++}
++
++static const char *http_protocol_whitelist( const char *url )
++{
++    return !strncasecmp( url, "https://", 8 )
++            ? HTTPS_PROTOCOL_WHITELIST : HTTP_PROTOCOL_WHITELIST;
++}
++
++static const char *hls_protocol_whitelist( const char *url )
++{
++    return !strncasecmp( url, "https://", 8 )
++            ? HTTPS_HLS_PROTOCOL_WHITELIST : HTTP_HLS_PROTOCOL_WHITELIST;
++}
++
++static BOOL http_open_allows_urlmon_fallback( const char *url, int ret )
++{
++    /* In the pinned FFmpeg, TLS certificate/hostname failures return EIO and
++     * protocol-whitelist rejections return EINVAL.  Restrict the compatibility
++     * retry to plain HTTP media which reached probe/header validation. */
++    return url && !strncasecmp( url, "http://", 7 ) && ret == AVERROR_INVALIDDATA;
++}
++
+ static BOOL is_http_hls_url( const char *url )
+ {
+     const char *cursor;
+ 
+-    if (!url || (strncasecmp( url, "http://", 7 ) && strncasecmp( url, "https://", 8 ))) return FALSE;
++    if (!is_http_url( url )) return FALSE;
+ 
+-    for (cursor = url; *cursor; cursor++)
++    cursor = url + (!strncasecmp( url, "http://", 7 ) ? 7 : 8);
++    while (*cursor && *cursor != '/' && *cursor != '?' && *cursor != '#') cursor++;
++    if (*cursor != '/') return FALSE;
++
++    for (; *cursor && *cursor != '?' && *cursor != '#'; cursor++)
+         if (!strncasecmp( cursor, ".m3u8", 5 ) || !strncasecmp( cursor, "/hls_playlist/", 14 )) return TRUE;
+ 
+     return FALSE;
+@@ -874,6 +915,7 @@ NTSTATUS demuxer_create( void *arg )
+     enum direct_network_url rtsp_kind;
+     AVDictionary *options = NULL;
+     char *direct_url = NULL;
++    NTSTATUS failure_status = STATUS_UNSUCCESSFUL;
+     int i, ret;
+ 
+     TRACE( "context %p, remote URL %s, mime %s\n", params->context,
+@@ -893,23 +935,82 @@ NTSTATUS demuxer_create( void *arg )
+     if (is_http_hls_url( params->url ))
+     {
+         const AVInputFormat *hls = av_find_input_format( "hls" );
++        const char *protocol_whitelist = hls_protocol_whitelist( params->url );
+ 
++        TRACE( "media-route=direct-hls\n" );
+         /* HLS playlists need the source URL as their base URI so relative
+          * segment URLs can be resolved.  The custom bytestream path only
+          * exposes the downloaded manifest bytes, which breaks YouTube HLS
+-         * streams used by VRChat's in-game video player. */
++         * streams used by VRChat's in-game video player.  Verify the root TLS
++         * connection and prevent an HTTPS-root playlist from downgrading.  The
++         * HLS-only crypto wrapper is required for AES-128 segments; its nested
++         * URL remains constrained by the same root-sensitive allowlist. */
++        if (av_dict_set( &options, "protocol_whitelist", protocol_whitelist, 0 ) < 0) goto failed;
++        if (av_dict_set_int( &options, "tls_verify", 1, 0 ) < 0) goto failed;
+         demuxer->direct_url = TRUE;
+         demuxer->io_timeout = HLS_IO_TIMEOUT_US;
+         demuxer->ctx->interrupt_callback.callback = demuxer_interrupt_callback;
+         demuxer->ctx->interrupt_callback.opaque = demuxer;
+         demuxer_set_deadline( demuxer, HLS_IO_TIMEOUT_US );
+-        if ((ret = avformat_open_input( &demuxer->ctx, params->url, hls, NULL )) < 0)
++        if ((ret = avformat_open_input( &demuxer->ctx, params->url, hls, &options )) < 0)
+         {
+             demuxer_set_deadline( demuxer, 0 );
+             ERR( "Failed to open HLS URL, error %s.\n", debugstr_averr(ret) );
+             goto failed;
+         }
+         demuxer_set_deadline( demuxer, 0 );
++        av_dict_set( &options, "tls_verify", NULL, 0 );
++        if (av_dict_count( options ))
++        {
++            ERR( "FFmpeg left %d required HLS option(s) unused.\n", av_dict_count( options ) );
++            goto failed;
++        }
++        av_dict_free( &options );
++    }
++    else if (is_http_url( params->url ))
++    {
++        const char *protocol_whitelist;
++        BOOL interrupted;
++
++        TRACE( "media-route=direct-http-progressive\n" );
++        /* Progressive HTTP media should start as FFmpeg receives bytes instead
++         * of waiting for URLMon to cache the complete response.  Keep the
++         * protocol surface deliberately narrower than the configured FFmpeg
++         * build.  Plain HTTP may upgrade to verified HTTPS, while HTTPS cannot
++         * downgrade to plaintext. */
++        protocol_whitelist = http_protocol_whitelist( params->url );
++        if (av_dict_set( &options, "protocol_whitelist", protocol_whitelist, 0 ) < 0) goto failed;
++        if (av_dict_set_int( &options, "tls_verify", 1, 0 ) < 0) goto failed;
++
++        demuxer->direct_url = TRUE;
++        demuxer->require_avio_seek = TRUE;
++        demuxer->io_timeout = HTTP_IO_TIMEOUT_US;
++        demuxer->ctx->interrupt_callback.callback = demuxer_interrupt_callback;
++        demuxer->ctx->interrupt_callback.opaque = demuxer;
++        demuxer_set_deadline( demuxer, HTTP_OPEN_TIMEOUT_US );
++        ret = avformat_open_input( &demuxer->ctx, params->url, NULL, &options );
++        interrupted = demuxer_interrupt_callback( demuxer );
++        demuxer_set_deadline( demuxer, 0 );
++        if (ret < 0)
++        {
++            /* A timeout or cancellation must stay terminal.  Falling back to
++             * uncancellable URLMon after an interrupt would defeat the bound. */
++            if (!interrupted && http_open_allows_urlmon_fallback( params->url, ret ))
++                failure_status = STATUS_BAD_NETWORK_PATH;
++            WARN( "Failed to open progressive HTTP URL directly, error %s.\n", debugstr_averr(ret) );
++            goto failed;
++        }
++        TRACE( "media-route=direct-http-progressive-opened\n" );
++        /* The HTTP protocol keeps chained options for redirects and range
++         * reopens.  A plaintext-only request leaves tls_verify in this outer
++         * dictionary even though a later HTTPS hop still consumes it. */
++        av_dict_set( &options, "tls_verify", NULL, 0 );
++        if (av_dict_count( options ))
++        {
++            ERR( "FFmpeg left %d required HTTP option(s) unused.\n", av_dict_count( options ) );
++            goto failed;
++        }
++        av_dict_free( &options );
+     }
+     else if ((rtsp_kind = get_rtsp_url_kind( params->url )))
+     {
+@@ -956,7 +1057,7 @@ NTSTATUS demuxer_create( void *arg )
+         }
+     }
+     format = demuxer->ctx->iformat;
+-    if ((params->duration = get_context_duration( demuxer->ctx )) == AV_NOPTS_VALUE ||
++    if ((params->duration = get_context_duration( demuxer->ctx, !demuxer->direct_url )) == AV_NOPTS_VALUE ||
+         strstr( format->name, "mp3" ) || strstr( format->name, "mpeg" ) ||
+         context_has_video_missing_frame_rate( demuxer->ctx ))
+     {
+@@ -968,7 +1069,7 @@ NTSTATUS demuxer_create( void *arg )
+             goto failed;
+         }
+         if (demuxer->io_timeout) demuxer_set_deadline( demuxer, 0 );
+-        params->duration = get_context_duration( demuxer->ctx );
++        params->duration = get_context_duration( demuxer->ctx, !demuxer->direct_url );
+     }
+     demuxer->duration = params->duration;
+     if (!(demuxer->streams = calloc( demuxer->ctx->nb_streams, sizeof(*demuxer->streams) ))) goto failed;
+@@ -999,7 +1100,9 @@ NTSTATUS demuxer_create( void *arg )
+         strcpy( params->mime_type, "video/x-application" );
+     }
+ 
+-    if (strstr( format->name, "mp4" )) parse_mp4_streams_metadata( demuxer );
++    /* parse_mp4_streams_metadata() operates on Wine's custom stream_context.
++     * A direct URL owns an FFmpeg network AVIO context instead. */
++    if (!demuxer->direct_url && strstr( format->name, "mp4" )) parse_mp4_streams_metadata( demuxer );
+     return STATUS_SUCCESS;
+ 
+ failed:
+@@ -1018,7 +1121,7 @@ failed:
+     free( demuxer );
+ 
+     mediaconv_demuxer_exit();
+-    return STATUS_UNSUCCESSFUL;
++    return failure_status;
+ }
+ 
+ NTSTATUS demuxer_destroy( void *arg )
+-- 
+2.54.0

@@ -1,0 +1,144 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: RTSP-on-GE11 contributors <noreply@invalid>
+Date: Mon, 13 Jul 2026 16:45:34 -0500
+Subject: [PATCH alpha 1/4] winedmo: Open RTSP URLs through FFmpeg
+
+Keep GE's existing HTTP(S) HLS and custom byte-stream paths unchanged. Let FFmpeg negotiate literal RTSP endpoints directly, and recognize the historical rtspt spelling as an RTSP-over-interleaved-TCP alias. Bound RTSP socket I/O so an unavailable endpoint does not occupy a Media Foundation worker forever.
+
+This alpha patch establishes direct URL opening. The following patch layers on
+FFmpeg interruption, source-shutdown cancellation, and live seekability
+propagation.
+
+A3.19: rebased after GE-Proton11-6's ge-video-rework set.
+---
+diff --git a/dlls/winedmo/unix_demuxer.c b/dlls/winedmo/unix_demuxer.c
+index aa8fe07b91884e35271b2b0c5b4021cf0b9a201e..3c9c51aa3ed2dd0fedb89419bbb0717f489f0874 100644
+--- a/dlls/winedmo/unix_demuxer.c
++++ b/dlls/winedmo/unix_demuxer.c
+@@ -23,6 +23,8 @@
+ #include "config.h"
+ #include "unix_private.h"
+ 
++#include <strings.h>
++
+ #include "wine/debug.h"
+ 
+ #ifdef HAVE_FFMPEG
+@@ -808,6 +810,46 @@ static BOOL is_googlevideo_url( const char *url )
+     return !!strstr( url, ".googlevideo.com/videoplayback" );
+ }
+ 
++enum direct_network_url
++{
++    DIRECT_NETWORK_NONE,
++    DIRECT_NETWORK_RTSP,
++    DIRECT_NETWORK_RTSP_TCP,
++};
++
++static enum direct_network_url get_rtsp_url_kind( const char *url )
++{
++    if (!url) return DIRECT_NETWORK_NONE;
++    if (!strncasecmp( url, "rtsp://", 7 )) return DIRECT_NETWORK_RTSP;
++    if (!strncasecmp( url, "rtspt://", 8 )) return DIRECT_NETWORK_RTSP_TCP;
++    return DIRECT_NETWORK_NONE;
++}
++
++static char *normalize_rtsp_url( const char *url, enum direct_network_url kind )
++{
++    const char *suffix;
++    char *ret;
++    size_t len;
++
++    switch (kind)
++    {
++    case DIRECT_NETWORK_RTSP:
++        suffix = url + 4; /* Preserve everything beginning with the colon. */
++        break;
++    case DIRECT_NETWORK_RTSP_TCP:
++        suffix = url + 5;
++        break;
++    default:
++        return NULL;
++    }
++
++    len = 4 + strlen( suffix ) + 1;
++    if (!(ret = malloc( len ))) return NULL;
++    memcpy( ret, "rtsp", 4 );
++    memcpy( ret + 4, suffix, len - 4 );
++    return ret;
++}
++
+ static void demuxer_free_context( struct demuxer *demuxer )
+ {
+     if (!demuxer->ctx) return;
+@@ -827,9 +869,13 @@ NTSTATUS demuxer_create( void *arg )
+     const char *ext = params->url ? strrchr( params->url, '.' ) : NULL;
+     const AVInputFormat *format;
+     struct demuxer *demuxer;
++    enum direct_network_url rtsp_kind;
++    AVDictionary *options = NULL;
++    char *direct_url = NULL;
+     int i, ret;
+ 
+-    TRACE( "context %p, url %s, mime %s\n", params->context, debugstr_a(params->url), debugstr_a(params->mime_type) );
++    TRACE( "context %p, remote URL %s, mime %s\n", params->context,
++           params->url ? "present" : "absent", debugstr_a(params->mime_type) );
+ 
+     /* Persona 4 Arena Ultimax loads extensionless ASF assets; keep this
+      * non-NULL before the format-name MIME checks below. */
+@@ -870,6 +916,31 @@ NTSTATUS demuxer_create( void *arg )
+             goto failed;
+         }
+     }
++    else if ((rtsp_kind = get_rtsp_url_kind( params->url )))
++    {
++        const AVInputFormat *rtsp = av_find_input_format( "rtsp" );
++
++        if (!rtsp || !(direct_url = normalize_rtsp_url( params->url, rtsp_kind ))) goto failed;
++        if (av_dict_set_int( &options, "timeout", 15000000, 0 ) < 0) goto failed;
++        if (rtsp_kind == DIRECT_NETWORK_RTSP_TCP &&
++            av_dict_set( &options, "rtsp_transport", "tcp", 0 ) < 0) goto failed;
++
++        demuxer->direct_url = TRUE;
++        if ((ret = avformat_open_input( &demuxer->ctx, direct_url, rtsp, &options )) < 0)
++        {
++            ERR( "Failed to open RTSP input, error %s.\n", debugstr_averr(ret) );
++            goto failed;
++        }
++        if (av_dict_count( options ))
++        {
++            ERR( "FFmpeg left %d required RTSP option(s) unused.\n", av_dict_count( options ) );
++            goto failed;
++        }
++
++        av_dict_free( &options );
++        free( direct_url );
++        direct_url = NULL;
++    }
+     else
+     {
+         if (!(demuxer->ctx->pb = avio_alloc_context( NULL, 0, 0, params->context, unix_read_callback, NULL,
+@@ -934,6 +1005,8 @@ NTSTATUS demuxer_create( void *arg )
+     return STATUS_SUCCESS;
+ 
+ failed:
++    av_dict_free( &options );
++    free( direct_url );
+     i = demuxer->ctx ? demuxer->ctx->nb_streams : 0;
+     demuxer_free_context( demuxer );
+     if (demuxer->streams)
+diff --git a/dlls/winedmo/winedmo.rgs b/dlls/winedmo/winedmo.rgs
+index a2675322800efe3a5f0dbe0919609b068096fb30..5fbe58e4b9ba059f3caba8b1c470a4e21840de82 100644
+--- a/dlls/winedmo/winedmo.rgs
++++ b/dlls/winedmo/winedmo.rgs
+@@ -62,6 +62,10 @@ HKLM
+                     {
+                         val '{587eeb6a-7336-4ebd-a4f2-91c948de622c}' = s 'winedmo Scheme Handler'
+                     }
++                    'rtspt:'
++                    {
++                        val '{587eeb6a-7336-4ebd-a4f2-91c948de622c}' = s 'winedmo Scheme Handler'
++                    }
+                 }
+             }
+         }

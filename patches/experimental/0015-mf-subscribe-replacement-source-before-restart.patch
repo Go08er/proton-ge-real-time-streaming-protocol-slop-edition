@@ -1,0 +1,69 @@
+From d1f9b5f2ef280ade70352065865654c543c6da0d Mon Sep 17 00:00:00 2001
+From: RTSP-on-GE design <rtsp-on-ge@example.invalid>
+Date: Wed, 22 Jul 2026 15:20:00 -0500
+Subject: [PATCH] mf: start an already-stopped replacement presentation directly
+
+MFSESSION_SETTOPOLOGY_IMMEDIATE clears the current presentation while leaving
+the MediaSession state started.  The replacement source and source-stream
+nodes are newly initialized in OBJ_STATE_STOPPED, however.  A positioned Start
+therefore enters the restart path and calls Stop() on a source which has never
+started.  No source event subscription exists for the new presentation, so its
+MESourceStopped acknowledgement is orphaned and the restart never completes.
+
+Treat an installed presentation whose source nodes are already all stopped as
+a fresh start.  This routes it through the existing stopped-state block, which
+subscribes the current sources and starts them directly.  Mark the old clock
+stopped as well so the existing start-clock path resets a VT_EMPTY fresh start
+to zero instead of retaining the removed presentation's time.  Ordinary seeks
+still use the existing asynchronous stop/restart path.
+---
+ dlls/mf/session.c | 14 +++++++++++---
+ 1 file changed, 11 insertions(+), 3 deletions(-)
+
+diff --git a/dlls/mf/session.c b/dlls/mf/session.c
+--- a/dlls/mf/session.c
++++ b/dlls/mf/session.c
+@@ -1181,6 +1181,7 @@ static void session_flush_sinks(struct media_session *session)
+ 
+ static HRESULT session_get_stream_sink_type(IMFStreamSink *sink, IMFMediaType **media_type);
+ static HRESULT session_start_clock(struct media_session *session);
++static BOOL session_is_source_nodes_state(struct media_session *session, enum object_state state);
+ 
+ static void session_flush_nodes(struct media_session *session)
+ {
+@@ -1195,15 +1196,16 @@ static void session_start(struct media_session *session, const GUID *time_format
+ {
+     struct media_source *source;
+     struct topo_node *topo_node;
+-    BOOL keep_position;
++    BOOL keep_position, sources_stopped;
+     MFTIME duration;
+     HRESULT hr;
+     UINT i;
+ 
+     keep_position = IsEqualGUID(time_format, &GUID_NULL) && start_position->vt == VT_EMPTY;
++    sources_stopped = session_is_source_nodes_state(session, OBJ_STATE_STOPPED);
+ 
+     /* No position change - nothing to do. */
+-    if (session->state == SESSION_STATE_STARTED && keep_position)
++    if (session->state == SESSION_STATE_STARTED && keep_position && !sources_stopped)
+     {
+         hr = session_start_clock(session);
+         session_command_complete_with_event(session, MESessionStarted, hr, NULL);
+@@ -1213,7 +1215,13 @@ static void session_start(struct media_session *session, const GUID *time_format
+     {
+         case SESSION_STATE_PAUSED:
+         case SESSION_STATE_STARTED:
+-            if (!keep_position)
++            if (sources_stopped)
++            {
++                /* An immediate replacement is a fresh, not a running, presentation. */
++                session->state = SESSION_STATE_STOPPED;
++                session->clock_started = FALSE;
++            }
++            else if (!keep_position)
+             {
+                 session->command_state = COMMAND_STATE_RESTARTING_SOURCES;
+ 
+-- 
+2.52.0

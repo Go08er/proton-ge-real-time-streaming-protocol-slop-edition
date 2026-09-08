@@ -1,0 +1,51 @@
+From 0a2bc53729c398ac881c9d3af42118a12ffcb3ee Mon Sep 17 00:00:00 2001
+From: RTSP-on-GE design <rtsp-on-ge@example.invalid>
+Date: Wed, 22 Jul 2026 13:30:00 -0500
+Subject: [PATCH] mfmediaengine: preserve pending start across source
+ replacement
+
+MediaEngine stages a VT_I8 start position before asynchronous source
+resolution. Replacing a running source then clears the old presentation,
+including that pending value. The following session Start receives VT_EMPTY;
+when the MediaSession is already started, it treats that as keep-position and
+does not start the streams in the newly installed topology.
+
+Separate value-only pending playback state from the refcounted presentation
+resources. Detach only the old source, descriptor, and frame sink before the
+source Shutdown lock drop. This also preserves a same-generation pre-ready
+seek and cannot restore a stale snapshot over a newer reentrant update.
+---
+ dlls/mfmediaengine/main.c | 10 ++++++++--
+ 1 file changed, 8 insertions(+), 2 deletions(-)
+
+diff --git a/dlls/mfmediaengine/main.c b/dlls/mfmediaengine/main.c
+--- a/dlls/mfmediaengine/main.c
++++ b/dlls/mfmediaengine/main.c
+@@ -208,6 +208,7 @@ struct media_engine
+     {
+         IMFMediaSource *source;
+         IMFPresentationDescriptor *pd;
++        /* Pending MediaSession start state; always VT_EMPTY or VT_I8. */
+         PROPVARIANT start_position;
+         struct video_frame_sink *frame_sink;
+     } presentation;
+@@ -1532,10 +1534,15 @@ static void media_engine_clear_presentation(struct media_engine *engine)
+     struct video_frame_sink *frame_sink = engine->presentation.frame_sink;
+     IMFMediaSource *source = engine->presentation.source;
+ 
+-    /* Detach the old presentation before dropping the lock.  A concurrent
++    /* Detach refcounted resources before dropping the lock.  A concurrent
+      * source load may install a new presentation while Shutdown() drains its
+      * callbacks; the old cleanup must never release or clear that new state. */
+-    memset(&engine->presentation, 0, sizeof(engine->presentation));
++    engine->presentation.source = NULL;
++    engine->presentation.pd = NULL;
++    engine->presentation.frame_sink = NULL;
++
++    /* start_position is pending value state owned by the current source
++     * generation.  media_engine_start_playback() consumes it. */
+ 
+     if (source)
+     {
+-- 
+2.52.0

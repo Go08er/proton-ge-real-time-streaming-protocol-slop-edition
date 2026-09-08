@@ -1,0 +1,12 @@
+/work/
+/worktrees/
+/sources/
+/build/
+/result
+/result-*
+/local-baselines/
+/logs/
+/dist/
+__pycache__/
+*.pyc
+*.log

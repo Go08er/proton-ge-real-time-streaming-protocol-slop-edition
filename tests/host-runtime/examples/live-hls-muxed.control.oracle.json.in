@@ -1,0 +1,55 @@
+{
+  "checkpoint_expectations": [
+    {
+      "action": "snapshot",
+      "ended": false,
+      "has_audio": true,
+      "has_video": true,
+      "label": "live-steady",
+      "max_matches": 8,
+      "min_matches": 8,
+      "min_time_span": 5.0,
+      "paused": false,
+      "seeking": false
+    }
+  ],
+  "event_order": [
+    "CANPLAY",
+    "PLAYING"
+  ],
+  "expected_driver_sha256": "@DRIVER_SHA256@",
+  "expected_exit_code": 0,
+  "expected_result": "pass",
+  "expected_scenario_sha256": "@SCENARIO_SHA256@",
+  "forbidden_events": [
+    "ERROR",
+    "STREAMRENDERINGERROR"
+  ],
+  "max_media_error_events": 0,
+  "max_monotonic_ms": 60000,
+  "max_source_generations": 1,
+  "max_time_regression": 0.1,
+  "max_timeout_snapshots": 0,
+  "min_action_counts": {
+    "snapshot": 8,
+    "wait_ms": 8
+  },
+  "min_playback_advance": 5.0,
+  "min_source_generations": 1,
+  "require_audio_each_generation": true,
+  "require_av_same_snapshot_each_generation": true,
+  "require_video_each_generation": true,
+  "required_actions": [
+    "load",
+    "play",
+    "snapshot",
+    "shutdown"
+  ],
+  "required_events": [
+    "CANPLAY",
+    "PLAYING"
+  ],
+  "required_events_per_generation": [
+    "CANPLAY"
+  ]
+}

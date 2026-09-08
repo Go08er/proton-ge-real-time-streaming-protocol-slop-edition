@@ -1,0 +1,23 @@
+# SPDX-License-Identifier: BSD-3-Clause
+load "http://127.0.0.1:18080/media?case=seek-storm"
+wait_event CANPLAY 15000
+play
+wait_event PLAYING 5000
+wait_time 10.000 20000
+
+# Model a seek bar that dispatches while the pointer moves. The 10.000 targets
+# are near-clock synchronization corrections and must not start backend seeks;
+# all 300 interim targets are superseded. Only final 83.250 may complete.
+loop 150
+seek 10.000
+wait_ms 10
+seek 82.750
+wait_ms 10
+endloop
+seek 83.250
+wait_event SEEKED 15000
+wait_time 84.250 15000
+snapshot "seek-storm-final"
+wait_ms 1000
+snapshot "seek-storm-steady"
+shutdown

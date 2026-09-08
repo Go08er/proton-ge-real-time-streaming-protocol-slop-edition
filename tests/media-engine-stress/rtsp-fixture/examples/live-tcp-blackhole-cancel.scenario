@@ -1,0 +1,18 @@
+# SPDX-License-Identifier: BSD-3-Clause
+# The relay forwards exactly 2 MiB from server to client, then stops reading
+# that direction while retaining both sockets and client-to-server control.
+load "rtsp://127.0.0.1:18554/fixture"
+wait_event CANPLAY 20000
+play
+wait_event PLAYING 10000
+wait_ms 1000
+snapshot "rtsp-blackhole-precondition"
+wait_ms 6500
+snapshot "rtsp-blackhole-before-pause"
+pause
+wait_event PAUSE 1000
+snapshot "rtsp-blackhole-before-resume"
+play
+wait_event PLAYING 1000
+snapshot "rtsp-blackhole-before-shutdown"
+shutdown

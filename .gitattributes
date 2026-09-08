@@ -1,0 +1,7 @@
+# Hash-pinned inputs must not be rewritten by a checkout's autocrlf setting.
+patches/** -text
+config/** -text
+release-manifests/** -text
+release-approvals/** -text
+*.sh text eol=lf
+*.py text eol=lf

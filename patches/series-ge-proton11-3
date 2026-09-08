@@ -1,0 +1,21 @@
+# GE-Proton11-3 alpha series. Applied after GE's ge-video-rework set.
+experimental/0001-winedmo-open-rtsp-over-tcp.patch
+experimental/0002-winedmo-interrupt-network-demux-and-report-live-seekability.patch
+experimental/0003-winedmo-use-destroy-params-for-wow64-demuxer.patch
+experimental/0004-winedmo-async-http-and-repair-vod-seeking.patch
+experimental/0005-winedmo-stream-progressive-http-vod.patch
+experimental/0006-winedmo-recover-interrupted-vod-seeks.patch
+experimental/0007-mf-reprime-and-resume-after-vod-seeks.patch
+experimental/0008-winedmo-preserve-audio-timeline-across-flush.patch
+experimental/0009-mf-sar-preserve-running-state-across-flush.patch
+experimental/0011-mf-fix-initial-presentation-clock-offset.patch
+experimental/0013-mfmediaengine-reconcile-pause-scrub-intent.patch
+experimental/0014-mfmediaengine-preserve-pending-start-position.patch
+experimental/0015-mf-order-immediate-replacement-start.patch
+experimental/0017-winedmo-propagate-terminal-network-read-errors.patch
+experimental/0018-winewayland-advertise-wine-vr-device-extensions.patch
+experimental/0019-winedmo-trace-bounded-rtsp-drain-state.patch
+
+# This exact series is integrated and source-audited against the immutable
+# GE-Proton11-3 release tag. The A3.14 candidate remains unbuilt under
+# PACKAGE_RELEASE=0.

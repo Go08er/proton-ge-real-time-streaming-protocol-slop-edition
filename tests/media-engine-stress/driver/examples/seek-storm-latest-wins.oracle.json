@@ -1,0 +1,95 @@
+{
+  "audio_check_labels": [
+    "seek-storm-final",
+    "seek-storm-steady"
+  ],
+  "checkpoint_expectations": [
+    {
+      "action": "snapshot",
+      "ended": false,
+      "has_audio": true,
+      "has_video": true,
+      "label": "seek-storm-final",
+      "max_matches": 1,
+      "max_time": 85.5,
+      "max_timeline_generation": 302,
+      "min_matches": 1,
+      "min_time": 84.2,
+      "min_timeline_generation": 302,
+      "paused": false,
+      "seeking": false
+    },
+    {
+      "action": "snapshot",
+      "ended": false,
+      "has_audio": true,
+      "has_video": true,
+      "label": "seek-storm-steady",
+      "max_matches": 1,
+      "max_time": 87.5,
+      "max_timeline_generation": 302,
+      "min_matches": 1,
+      "min_time": 85.0,
+      "min_timeline_generation": 302,
+      "paused": false,
+      "seeking": false
+    }
+  ],
+  "expected_driver_sha256": "70ba4f15f8d96a0890555ff1847050d7a45ebe1efe6479c42dd62a0cb22e808a",
+  "expected_exit_code": 0,
+  "expected_result": "pass",
+  "expected_scenario_sha256": "168944805e359640ae5492263c830f464be73adc5df81dc469ca1e650e61d389",
+  "forbidden_events": [
+    "ERROR",
+    "STREAMRENDERINGERROR"
+  ],
+  "max_audio_nonzero_silence_ms": 750,
+  "max_audio_silence_ms": 750,
+  "max_event_counts": {
+    "SEEKED": 1,
+    "SEEKING": 1
+  },
+  "max_media_error_events": 0,
+  "max_monotonic_ms": 120000,
+  "max_time_regression": 0.1,
+  "max_timeout_snapshots": 0,
+  "min_action_counts": {
+    "seek": 301,
+    "snapshot": 2,
+    "wait_ms": 301
+  },
+  "min_audio_bytes_generation": 4096,
+  "min_audio_nonzero_units_generation": 20,
+  "min_audio_samples_generation": 10,
+  "min_playback_advance": 0.75,
+  "min_source_generations": 1,
+  "require_audio_each_generation": true,
+  "require_av_same_snapshot_each_generation": true,
+  "require_video_each_generation": true,
+  "required_actions": [
+    "load",
+    "play",
+    "seek",
+    "snapshot",
+    "shutdown"
+  ],
+  "required_audio_payload_formats": [
+    "pcm16",
+    "pcm32",
+    "float32"
+  ],
+  "required_events": [
+    "CANPLAY",
+    "PLAYING",
+    "SEEKED"
+  ],
+  "required_events_per_generation": [
+    "CANPLAY"
+  ],
+  "required_seek_targets": [
+    10.0,
+    82.75,
+    83.25
+  ],
+  "seek_target_tolerance": 0.5
+}

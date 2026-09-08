@@ -1,0 +1,32 @@
+# SPDX-License-Identifier: BSD-3-Clause
+load "http://127.0.0.1:18765/media?case=rapid-scrub-common-codec"
+wait_event CANPLAY 15000
+play
+wait_event PLAYING 5000
+# Establish playback early, then keep the same source running to a clock that
+# is still more than GE's three-second synchronization window from SCRUB_1.
+wait_time @STARTUP_WAIT@ 5000
+wait_time @INITIAL_WAIT@ 10000
+snapshot "rapid-scrub-common-pre"
+
+# These eight actions must remain consecutive. The burst distinguishes
+# Proton-RTSP's immediate-leading/newest-pending behavior from a pure trailing
+# debounce while staying inside the 20-second VP9/Opus discovery member.
+seek @SCRUB_1@
+seek @SCRUB_2@
+seek @SCRUB_3@
+seek @SCRUB_4@
+seek @SCRUB_5@
+seek @SCRUB_6@
+seek @SCRUB_7@
+seek @SCRUB_8@
+
+# Both scheduler designs must eventually become idle at the final target. The
+# RTSP reference sidecar additionally requires completed first and final seeks.
+wait_seek_settled @SCRUB_8@ 0.500 20000
+snapshot "rapid-scrub-common-settled"
+wait_time @FINAL_WAIT@ 10000
+snapshot "rapid-scrub-common-post-settle"
+wait_ms 1000
+snapshot "rapid-scrub-common-post-settle"
+shutdown

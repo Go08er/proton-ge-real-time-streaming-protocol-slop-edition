@@ -1,0 +1,539 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: RTSP-on-GE design <rtsp-on-ge@example.invalid>
+Date: Mon, 13 Jul 2026 16:47:31 -0500
+Subject: [PATCH alpha 2/4] winedmo: make direct network demux teardown
+ interruptible
+
+Install FFmpeg interrupt callbacks for direct HLS and RTSP inputs, expose a cancellation call across the Unix boundary, and order media-source flush and shutdown so the worker is joined before the demuxer is destroyed.
+
+Bound RTSP open/probe operations to 30 seconds and RTSP read/seek/close operations to 15 seconds. HLS receives cancellation support without a new steady-state I/O deadline, preserving GE playback behavior.
+
+Report demuxer seekability to Media Foundation, avoid the synthetic
+seek-to-zero for live/unseekable streams, and discard any packet whose read or
+queue handoff overlapped a flush instead of re-queuing stale pre-seek data.
+
+A3.19: rebased after GE-Proton11-6's ge-video-rework set.
+Retain demuxer-reported seekability, not duration-based seek inference; preserve GE packet-discard handling inside the deadline-wrapped read.
+---
+diff --git a/dlls/winedmo/main.c b/dlls/winedmo/main.c
+index f4ea143e67e431419e342eaef8e3e66e2a749e94..884e846b60f5d34e1b1ca8dfcd1f387c133c7e25 100644
+--- a/dlls/winedmo/main.c
++++ b/dlls/winedmo/main.c
+@@ -498,6 +498,32 @@ NTSTATUS CDECL winedmo_demuxer_destroy( struct winedmo_demuxer *demuxer )
+     return status;
+ }
+ 
++NTSTATUS CDECL winedmo_demuxer_set_cancelled( struct winedmo_demuxer demuxer, BOOL cancelled )
++{
++    struct demuxer_set_cancelled_params params = {.demuxer = demuxer, .cancelled = !!cancelled};
++    NTSTATUS status;
++
++    if (!demuxer.handle) return STATUS_SUCCESS;
++    if ((status = UNIX_CALL( demuxer_set_cancelled, &params )))
++        WARN( "demuxer_set_cancelled failed, status %#lx\n", status );
++    return status;
++}
++
++NTSTATUS CDECL winedmo_demuxer_get_flags( struct winedmo_demuxer demuxer, UINT32 *flags )
++{
++    struct demuxer_get_flags_params params = {.demuxer = demuxer};
++    NTSTATUS status;
++
++    if (!flags) return STATUS_INVALID_PARAMETER;
++    *flags = 0;
++    if (!demuxer.handle) return STATUS_INVALID_HANDLE;
++    if ((status = UNIX_CALL( demuxer_get_flags, &params )))
++        WARN( "demuxer_get_flags failed, status %#lx\n", status );
++    else
++        *flags = params.flags;
++    return status;
++}
++
+ NTSTATUS CDECL winedmo_demuxer_read( struct winedmo_demuxer demuxer, UINT *stream, DMO_OUTPUT_DATA_BUFFER *buffer, UINT *buffer_size )
+ {
+     struct demuxer_read_params params = {.demuxer = demuxer};
+diff --git a/dlls/winedmo/media_source.c b/dlls/winedmo/media_source.c
+index 9fb324c3d6444d435709d6a73c82c1ea37d64694..454d69de18e92ef5f1d1bd88549c974495ae73b3 100644
+--- a/dlls/winedmo/media_source.c
++++ b/dlls/winedmo/media_source.c
+@@ -338,6 +338,7 @@ struct media_source
+     UINT64 stream_offset;
+     UINT64 duration;
+     bool has_duration;
++    bool seekable;
+ 
+     struct winedmo_demuxer demuxer;
+     struct
+@@ -853,7 +854,7 @@ static HRESULT media_stream_start(struct media_stream *stream, BOOL active, BOOL
+ static HRESULT media_source_start(struct media_source *source, IMFPresentationDescriptor *descriptor,
+         GUID *format, PROPVARIANT *position)
+ {
+-    BOOL starting = source->state == SOURCE_STOPPED, seek_message = !starting && position->vt != VT_EMPTY;
++    BOOL starting = source->state == SOURCE_STOPPED, seek_message;
+     IMFStreamDescriptor **descriptors;
+     DWORD i, count;
+     HRESULT hr;
+@@ -864,8 +865,16 @@ static HRESULT media_source_start(struct media_source *source, IMFPresentationDe
+     if (source->state == SOURCE_SHUTDOWN)
+         return MF_E_SHUTDOWN;
+ 
++    if (!source->seekable && position->vt != VT_EMPTY)
++    {
++        if (!starting || position->vt != VT_I8 || position->hVal.QuadPart)
++            return MF_E_INVALIDREQUEST;
++        position->vt = VT_EMPTY;
++    }
++    seek_message = !starting && position->vt != VT_EMPTY;
++
+     /* seek to beginning on stop->play */
+-    if (source->has_duration && source->state == SOURCE_STOPPED && position->vt == VT_EMPTY)
++    if (source->seekable && source->state == SOURCE_STOPPED && position->vt == VT_EMPTY)
+     {
+         position->vt = VT_I8;
+         position->hVal.QuadPart = 0;
+@@ -918,7 +927,9 @@ static HRESULT media_source_start(struct media_source *source, IMFPresentationDe
+         }
+ 
+         WARN("MF media source seek to %s.\n", debugstr_time(position->hVal.QuadPart));
++        winedmo_demuxer_set_cancelled(source->demuxer, TRUE);
+         EnterCriticalSection(&source->demuxer_cs);
++        winedmo_demuxer_set_cancelled(source->demuxer, FALSE);
+         winedmo_demuxer_seek(source->demuxer, position->hVal.QuadPart);
+         LeaveCriticalSection(&source->demuxer_cs);
+ 
+@@ -1192,6 +1203,14 @@ static DWORD CALLBACK source_demux_thread(void *arg)
+         status = winedmo_demuxer_read(source->demuxer, &stream_idx, &output, &needed_size);
+         LeaveCriticalSection(&source->demuxer_cs);
+ 
++        /* A flush can begin while the read is in flight.  Do not enqueue the
++         * packet that made the flush wait for demuxer_cs. */
++        if (source->flushing || source->demux_thread_shutdown)
++        {
++            IMediaBuffer_Release(&sbuf->IMediaBuffer_iface);
++            continue;
++        }
++
+         if (status == STATUS_BUFFER_TOO_SMALL)
+         {
+             IMediaBuffer_Release(&sbuf->IMediaBuffer_iface);
+@@ -1247,6 +1266,8 @@ static DWORD CALLBACK source_demux_thread(void *arg)
+ 
+         if ((pkt = malloc(sizeof(*pkt))) && (pkt->data = malloc(data_len)))
+         {
++            BOOL queued = FALSE;
++
+             memcpy(pkt->data, src_data, data_len);
+             pkt->size = data_len;
+             pkt->dts      = (output.dwStatus & DMO_OUTPUT_DATA_BUFFERF_TIME)
+@@ -1258,11 +1279,21 @@ static DWORD CALLBACK source_demux_thread(void *arg)
+             list_init(&pkt->entry);
+ 
+             EnterCriticalSection(&stream->queue_cs);
+-            list_add_tail(&stream->packet_queue, &pkt->entry);
+-            ++stream->queued_packets;
+-            stream->queued_bytes += pkt->size;
++            if (!source->flushing && !source->demux_thread_shutdown)
++            {
++                list_add_tail(&stream->packet_queue, &pkt->entry);
++                ++stream->queued_packets;
++                stream->queued_bytes += pkt->size;
++                queued = TRUE;
++            }
+             LeaveCriticalSection(&stream->queue_cs);
+-            WakeConditionVariable(&stream->queue_cv);
++            if (queued)
++                WakeConditionVariable(&stream->queue_cv);
++            else
++            {
++                free(pkt->data);
++                free(pkt);
++            }
+         }
+         else
+         {
+@@ -1963,7 +1994,7 @@ static HRESULT WINAPI media_source_GetCharacteristics(IMFMediaSource *iface, DWO
+     else
+     {
+         *characteristics = MFMEDIASOURCE_CAN_PAUSE;
+-        if (source->has_duration) *characteristics |= MFMEDIASOURCE_CAN_SEEK;
++        if (source->seekable) *characteristics |= MFMEDIASOURCE_CAN_SEEK;
+     }
+ 
+     LeaveCriticalSection(&source->cs);
+@@ -2018,6 +2049,9 @@ static HRESULT WINAPI media_source_Start(IMFMediaSource *iface, IMFPresentationD
+         hr = MF_E_SHUTDOWN;
+     else if (!(IsEqualIID(time_format, &GUID_NULL)))
+         hr = MF_E_UNSUPPORTED_TIME_FORMAT;
++    else if (!source->seekable && position->vt != VT_EMPTY &&
++             !(source->state == SOURCE_STOPPED && position->vt == VT_I8 && !position->hVal.QuadPart))
++        hr = MF_E_INVALIDREQUEST;
+     else if (SUCCEEDED(hr = source_create_async_op(SOURCE_ASYNC_START, &op)))
+     {
+         struct source_async_command *command = impl_from_async_command_IUnknown(op);
+@@ -2103,6 +2137,7 @@ static HRESULT WINAPI media_source_Shutdown(IMFMediaSource *iface)
+     /* Signal demux thread and all waiting stream queues to unblock. */
+     source->demux_thread_shutdown = true;
+     source->read_flushing = TRUE;
++    winedmo_demuxer_set_cancelled(source->demuxer, TRUE);
+ 
+     for (unsigned int i = 0; i < source->stream_count; i++)
+     {
+@@ -2194,6 +2229,7 @@ static HRESULT media_source_create(struct object_context *context, IMFMediaSourc
+ {
+     struct media_source *object;
+     UINT stream_count = 0;
++    UINT32 demuxer_flags = 0;
+     INT64 duration = 0;
+     WCHAR mime_type[256] = {0};
+     NTSTATUS status;
+@@ -2216,6 +2252,7 @@ static HRESULT media_source_create(struct object_context *context, IMFMediaSourc
+     object->file_size = context->file_size > context->stream_offset
+             ? context->file_size - context->stream_offset : (UINT64)-1;
+     object->rate = 1.0f;
++    object->seekable = true;
+     InitializeCriticalSectionEx(&object->cs, 0, RTL_CRITICAL_SECTION_FLAG_FORCE_DEBUG_INFO);
+     object->cs.DebugInfo->Spare[0] = (DWORD_PTR)(__FILE__ ": cs");
+     InitializeCriticalSectionEx(&object->demuxer_cs, 0, RTL_CRITICAL_SECTION_FLAG_FORCE_DEBUG_INFO);
+@@ -2241,6 +2278,8 @@ static HRESULT media_source_create(struct object_context *context, IMFMediaSourc
+         hr = HRESULT_FROM_NT(status);
+         goto fail;
+     }
++    if (!(status = winedmo_demuxer_get_flags(object->demuxer, &demuxer_flags)))
++        object->seekable = !!(demuxer_flags & WINEDMO_DEMUXER_FLAG_SEEKABLE);
+ 
+     if (duration > 0)
+     {
+@@ -2321,6 +2360,16 @@ static HRESULT media_source_create(struct object_context *context, IMFMediaSourc
+ fail:
+     WARN("Failed to construct MFMediaSource, hr %#lx.\n", hr);
+ 
++    if (object->demux_thread)
++    {
++        object->demux_thread_shutdown = true;
++        object->read_flushing = true;
++        winedmo_demuxer_set_cancelled(object->demuxer, TRUE);
++        WaitForSingleObject(object->demux_thread, INFINITE);
++        CloseHandle(object->demux_thread);
++        object->demux_thread = NULL;
++    }
++
+     while (object->streams && object->stream_count--)
+     {
+         struct media_stream *stream = object->streams[object->stream_count];
+@@ -2331,17 +2380,7 @@ fail:
+     free(object->streams);
+ 
+     if (object->demuxer.handle)
+-    {
+-        object->demux_thread_shutdown = true;
+         winedmo_demuxer_destroy(&object->demuxer);
+-    }
+-    if (object->demux_thread)
+-    {
+-        object->demux_thread_shutdown = true;
+-        /* Wake any blocked stream queues before joining. */
+-        WaitForSingleObject(object->demux_thread, INFINITE);
+-        CloseHandle(object->demux_thread);
+-    }
+     if (object->async_commands_queue)
+         MFUnlockWorkQueue(object->async_commands_queue);
+     if (object->event_queue)
+diff --git a/dlls/winedmo/unix_demuxer.c b/dlls/winedmo/unix_demuxer.c
+index 3c9c51aa3ed2dd0fedb89419bbb0717f489f0874..2faa2df429513811354e8d51fda391b75fc8ca77 100644
+--- a/dlls/winedmo/unix_demuxer.c
++++ b/dlls/winedmo/unix_demuxer.c
+@@ -29,8 +29,13 @@
+ 
+ #ifdef HAVE_FFMPEG
+ 
++#include <libavutil/time.h>
++
+ WINE_DEFAULT_DEBUG_CHANNEL(dmo);
+ 
++#define RTSP_OPEN_TIMEOUT_US INT64_C(30000000)
++#define RTSP_IO_TIMEOUT_US   INT64_C(15000000)
++
+ static inline const char *debugstr_averr( int err )
+ {
+     return wine_dbg_sprintf( "%d (%s)", err, av_err2str(err) );
+@@ -58,6 +63,9 @@ struct demuxer
+     INT64 duration;
+     INT64 live_timestamp_base;
+     BOOL direct_url;
++    INT64 io_timeout;
++    int cancelled;
++    INT64 deadline;
+ 
+     AVPacket *last_packet; /* last read packet */
+     struct stream *last_stream; /* last read packet stream */
+@@ -68,6 +76,30 @@ static struct demuxer *get_demuxer( struct winedmo_demuxer demuxer )
+     return (struct demuxer *)(UINT_PTR)demuxer.handle;
+ }
+ 
++static int demuxer_interrupt_callback( void *opaque )
++{
++    struct demuxer *demuxer = opaque;
++    INT64 deadline;
++
++    if (__atomic_load_n( &demuxer->cancelled, __ATOMIC_ACQUIRE )) return 1;
++    deadline = __atomic_load_n( &demuxer->deadline, __ATOMIC_RELAXED );
++    return deadline && av_gettime_relative() >= deadline;
++}
++
++static void demuxer_set_deadline( struct demuxer *demuxer, INT64 timeout )
++{
++    INT64 deadline = timeout ? av_gettime_relative() + timeout : 0;
++    __atomic_store_n( &demuxer->deadline, deadline, __ATOMIC_RELAXED );
++}
++
++static BOOL demuxer_is_seekable( const struct demuxer *demuxer )
++{
++    if (demuxer->ctx->ctx_flags & AVFMTCTX_UNSEEKABLE) return FALSE;
++    if (!demuxer->direct_url && demuxer->ctx->pb &&
++        !(demuxer->ctx->pb->seekable & AVIO_SEEKABLE_NORMAL)) return FALSE;
++    return TRUE;
++}
++
+ static INT64 get_user_time( INT64 time, AVRational time_base )
+ {
+     static const AVRational USER_TIME_BASE_Q = {1, 10000000};
+@@ -854,7 +886,12 @@ static void demuxer_free_context( struct demuxer *demuxer )
+ {
+     if (!demuxer->ctx) return;
+ 
+-    if (demuxer->direct_url) avformat_close_input( &demuxer->ctx );
++    if (demuxer->direct_url)
++    {
++        if (demuxer->io_timeout) demuxer_set_deadline( demuxer, demuxer->io_timeout );
++        avformat_close_input( &demuxer->ctx );
++        if (demuxer->io_timeout) demuxer_set_deadline( demuxer, 0 );
++    }
+     else
+     {
+         avio_context_free( &demuxer->ctx->pb );
+@@ -908,6 +945,8 @@ NTSTATUS demuxer_create( void *arg )
+             av_dict_set( &options, "reconnect_delay_max", "5", 0 );
+         }
+ 
++        demuxer->ctx->interrupt_callback.callback = demuxer_interrupt_callback;
++        demuxer->ctx->interrupt_callback.opaque = demuxer;
+         ret = avformat_open_input( &demuxer->ctx, params->url, format, &options );
+         av_dict_free( &options );
+         if (ret < 0)
+@@ -926,11 +965,17 @@ NTSTATUS demuxer_create( void *arg )
+             av_dict_set( &options, "rtsp_transport", "tcp", 0 ) < 0) goto failed;
+ 
+         demuxer->direct_url = TRUE;
++        demuxer->io_timeout = RTSP_IO_TIMEOUT_US;
++        demuxer->ctx->interrupt_callback.callback = demuxer_interrupt_callback;
++        demuxer->ctx->interrupt_callback.opaque = demuxer;
++        demuxer_set_deadline( demuxer, RTSP_OPEN_TIMEOUT_US );
+         if ((ret = avformat_open_input( &demuxer->ctx, direct_url, rtsp, &options )) < 0)
+         {
++            demuxer_set_deadline( demuxer, 0 );
+             ERR( "Failed to open RTSP input, error %s.\n", debugstr_averr(ret) );
+             goto failed;
+         }
++        demuxer_set_deadline( demuxer, 0 );
+         if (av_dict_count( options ))
+         {
+             ERR( "FFmpeg left %d required RTSP option(s) unused.\n", av_dict_count( options ) );
+@@ -960,11 +1005,14 @@ NTSTATUS demuxer_create( void *arg )
+         context_has_video_missing_frame_rate( demuxer->ctx ) ||
+         (strstr( format->name, "mp4" ) && context_has_h264_codec_aligned_dimensions( demuxer->ctx )))
+     {
++        if (demuxer->io_timeout) demuxer_set_deadline( demuxer, RTSP_OPEN_TIMEOUT_US );
+         if ((ret = avformat_find_stream_info( demuxer->ctx, NULL )) < 0)
+         {
++            if (demuxer->io_timeout) demuxer_set_deadline( demuxer, 0 );
+             ERR( "Failed to find stream info, error %s.\n", debugstr_averr(ret) );
+             goto failed;
+         }
++        if (demuxer->io_timeout) demuxer_set_deadline( demuxer, 0 );
+         params->duration = get_context_duration( demuxer->ctx );
+     }
+     demuxer->duration = params->duration;
+@@ -1044,6 +1092,26 @@ NTSTATUS demuxer_destroy( void *arg )
+     return STATUS_SUCCESS;
+ }
+ 
++NTSTATUS demuxer_set_cancelled( void *arg )
++{
++    struct demuxer_set_cancelled_params *params = arg;
++    struct demuxer *demuxer = get_demuxer( params->demuxer );
++
++    if (!demuxer) return STATUS_INVALID_HANDLE;
++    __atomic_store_n( &demuxer->cancelled, !!params->cancelled, __ATOMIC_RELEASE );
++    return STATUS_SUCCESS;
++}
++
++NTSTATUS demuxer_get_flags( void *arg )
++{
++    struct demuxer_get_flags_params *params = arg;
++    struct demuxer *demuxer = get_demuxer( params->demuxer );
++
++    if (!demuxer || !demuxer->ctx) return STATUS_INVALID_HANDLE;
++    params->flags = demuxer_is_seekable( demuxer ) ? WINEDMO_DEMUXER_FLAG_SEEKABLE : 0;
++    return STATUS_SUCCESS;
++}
++
+ static NTSTATUS demuxer_filter_packet( struct demuxer *demuxer, AVPacket **packet )
+ {
+     struct stream *stream;
+@@ -1064,19 +1132,25 @@ static NTSTATUS demuxer_filter_packet( struct demuxer *demuxer, AVPacket **packe
+             stream = demuxer->last_stream = NULL;
+         }
+ 
+-        if (!ret && !(ret = av_read_frame( demuxer->ctx, *packet )))
++        if (!ret)
+         {
+-            if (demuxer->ctx->iformat && strstr( demuxer->ctx->iformat->name, "mp4" ) &&
+-                    ((*packet)->flags & AV_PKT_FLAG_DISCARD))
++            if (demuxer->io_timeout) demuxer_set_deadline( demuxer, demuxer->io_timeout );
++            ret = av_read_frame( demuxer->ctx, *packet );
++            if (demuxer->io_timeout) demuxer_set_deadline( demuxer, 0 );
++            if (!ret)
+             {
+-                av_packet_free( packet );
+-                continue;
++                if (demuxer->ctx->iformat && strstr( demuxer->ctx->iformat->name, "mp4" ) &&
++                        ((*packet)->flags & AV_PKT_FLAG_DISCARD))
++                {
++                    av_packet_free( packet );
++                    continue;
++                }
++
++                stream = demuxer->streams + (*packet)->stream_index;
++                ret = av_bsf_send_packet( stream->filter, (*packet) );
++                if (ret < 0) WARN( "Failed to send packet to filter, error %s.\n", debugstr_averr( ret ) );
++                else demuxer->last_stream = stream;
+             }
+-
+-            stream = demuxer->streams + (*packet)->stream_index;
+-            ret = av_bsf_send_packet( stream->filter, (*packet) );
+-            if (ret < 0) WARN( "Failed to send packet to filter, error %s.\n", debugstr_averr( ret ) );
+-            else demuxer->last_stream = stream;
+         }
+         av_packet_free( packet );
+ 
+@@ -1176,12 +1250,17 @@ NTSTATUS demuxer_seek( void *arg )
+ 
+     TRACE( "demuxer %p, timestamp 0x%s\n", demuxer, wine_dbgstr_longlong( params->timestamp ) );
+ 
++    if (!demuxer_is_seekable( demuxer )) return STATUS_NOT_SUPPORTED;
++
+     if (!(status = raw_mpegvideo_seek( demuxer, params->timestamp )))
+         goto done;
+     if (status != STATUS_NOT_SUPPORTED)
+         return status;
+ 
+-    if ((ret = avformat_seek_file( demuxer->ctx, -1, INT64_MIN, timestamp, timestamp, AVSEEK_FLAG_BACKWARD )) < 0)
++    if (demuxer->io_timeout) demuxer_set_deadline( demuxer, demuxer->io_timeout );
++    ret = avformat_seek_file( demuxer->ctx, -1, INT64_MIN, timestamp, timestamp, AVSEEK_FLAG_BACKWARD );
++    if (demuxer->io_timeout) demuxer_set_deadline( demuxer, 0 );
++    if (ret < 0)
+     {
+         ERR( "Failed to seek demuxer %p, error %s.\n", demuxer, debugstr_averr(ret) );
+         return STATUS_UNSUCCESSFUL;
+diff --git a/dlls/winedmo/unix_private.h b/dlls/winedmo/unix_private.h
+index 8dee70b924cb9373545550c2727d70808fa78411..ffa97e56f45ac1bc472b0c535051d5a4b3a58280 100644
+--- a/dlls/winedmo/unix_private.h
++++ b/dlls/winedmo/unix_private.h
+@@ -74,6 +74,8 @@ extern int unix_read_callback( void *opaque, uint8_t *buffer, int size );
+ extern NTSTATUS demuxer_check( void * );
+ extern NTSTATUS demuxer_create( void * );
+ extern NTSTATUS demuxer_destroy( void * );
++extern NTSTATUS demuxer_set_cancelled( void * );
++extern NTSTATUS demuxer_get_flags( void * );
+ extern NTSTATUS demuxer_read( void * );
+ extern NTSTATUS demuxer_seek( void * );
+ extern NTSTATUS demuxer_stream_lang( void * );
+diff --git a/dlls/winedmo/unixlib.c b/dlls/winedmo/unixlib.c
+index 29dfba72c90fefc67507a734dffc97b936220eab..657e498c1aab8004deff12eba61cabfe7646660a 100644
+--- a/dlls/winedmo/unixlib.c
++++ b/dlls/winedmo/unixlib.c
+@@ -163,6 +163,8 @@ const unixlib_entry_t __wine_unix_call_funcs[] =
+     X( demuxer_check ),
+     X( demuxer_create ),
+     X( demuxer_destroy ),
++    X( demuxer_set_cancelled ),
++    X( demuxer_get_flags ),
+     X( demuxer_read ),
+     X( demuxer_seek ),
+     X( demuxer_stream_lang ),
+@@ -243,6 +245,8 @@ const unixlib_entry_t __wine_unix_call_wow64_funcs[] =
+     X( demuxer_check ),
+     X64( demuxer_create ),
+     X64( demuxer_destroy ),
++    X( demuxer_set_cancelled ),
++    X( demuxer_get_flags ),
+     X( demuxer_read ),
+     X( demuxer_seek ),
+     X( demuxer_stream_lang ),
+diff --git a/dlls/winedmo/unixlib.h b/dlls/winedmo/unixlib.h
+index b2b6a30fbb1bbe960160660674839f2df0c43217..672433086e2e04e75fa8e90b8b8fb5f800abd530 100644
+--- a/dlls/winedmo/unixlib.h
++++ b/dlls/winedmo/unixlib.h
+@@ -119,6 +119,18 @@ struct demuxer_destroy_params
+     struct stream_context *context;
+ };
+ 
++struct demuxer_set_cancelled_params
++{
++    struct winedmo_demuxer demuxer;
++    UINT32 cancelled;
++};
++
++struct demuxer_get_flags_params
++{
++    struct winedmo_demuxer demuxer;
++    UINT32 flags;
++};
++
+ struct demuxer_read_params
+ {
+     struct winedmo_demuxer demuxer;
+@@ -270,6 +282,8 @@ enum unix_funcs
+     unix_demuxer_check,
+     unix_demuxer_create,
+     unix_demuxer_destroy,
++    unix_demuxer_set_cancelled,
++    unix_demuxer_get_flags,
+     unix_demuxer_read,
+     unix_demuxer_seek,
+     unix_demuxer_stream_lang,
+diff --git a/dlls/winedmo/winedmo.spec b/dlls/winedmo/winedmo.spec
+index fad46a891c1c935bf9cfcd7858f81c58e3b1879a..8b062f605caf7bc05f89f9825aca0e3125ebebd2 100644
+--- a/dlls/winedmo/winedmo.spec
++++ b/dlls/winedmo/winedmo.spec
+@@ -5,6 +5,8 @@
+ @ cdecl winedmo_demuxer_check(str)
+ @ cdecl winedmo_demuxer_create(wstr ptr int64 ptr ptr ptr ptr)
+ @ cdecl winedmo_demuxer_destroy(ptr)
++@ cdecl winedmo_demuxer_set_cancelled(int64 long)
++@ cdecl winedmo_demuxer_get_flags(int64 ptr)
+ @ cdecl winedmo_demuxer_read(int64 ptr ptr ptr)
+ @ cdecl winedmo_demuxer_seek(int64 int64)
+ @ cdecl winedmo_demuxer_stream_lang(int64 long ptr long)
+diff --git a/include/wine/winedmo.h b/include/wine/winedmo.h
+index 444c896d6b4d25be89bfc7c05861083e66a62d59..e09812b408d2feaa7d85c08603940929cf06556d 100644
+--- a/include/wine/winedmo.h
++++ b/include/wine/winedmo.h
+@@ -44,6 +44,8 @@ struct winedmo_demuxer   { UINT64 handle; };
+ struct winedmo_muxer     { UINT64 handle; };
+ struct winedmo_transform { UINT64 handle; };
+ 
++#define WINEDMO_DEMUXER_FLAG_SEEKABLE 0x00000001
++
+ /* Flags for winedmo_transform_push_input */
+ #define WINEDMO_SAMPLE_FLAG_SYNC_POINT      0x01
+ #define WINEDMO_SAMPLE_FLAG_DISCONTINUITY   0x02
+@@ -65,6 +67,8 @@ NTSTATUS CDECL winedmo_demuxer_check( const char *mime_type );
+ NTSTATUS CDECL winedmo_demuxer_create( const WCHAR *url, struct winedmo_stream *stream, UINT64 stream_size, INT64 *duration,
+                                        UINT *stream_count, WCHAR *mime_type, struct winedmo_demuxer *demuxer );
+ NTSTATUS CDECL winedmo_demuxer_destroy( struct winedmo_demuxer *demuxer );
++NTSTATUS CDECL winedmo_demuxer_set_cancelled( struct winedmo_demuxer demuxer, BOOL cancelled );
++NTSTATUS CDECL winedmo_demuxer_get_flags( struct winedmo_demuxer demuxer, UINT32 *flags );
+ NTSTATUS CDECL winedmo_demuxer_read( struct winedmo_demuxer demuxer, UINT *stream, DMO_OUTPUT_DATA_BUFFER *buffer, UINT *buffer_size );
+ NTSTATUS CDECL winedmo_demuxer_seek( struct winedmo_demuxer demuxer, INT64 timestamp );
+ NTSTATUS CDECL winedmo_demuxer_stream_lang( struct winedmo_demuxer demuxer, UINT stream, WCHAR *buffer, UINT len );

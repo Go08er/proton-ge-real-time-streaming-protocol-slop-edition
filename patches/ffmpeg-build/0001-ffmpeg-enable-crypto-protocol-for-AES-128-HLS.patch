@@ -1,0 +1,32 @@
+From b4e5b7566addfaa86a81b84d4f07259d1861c217 Mon Sep 17 00:00:00 2001
+From: RTSP-on-GE11 contributors <noreply@invalid>
+Date: Wed, 15 Jul 2026 15:00:00 -0500
+Subject: [PATCH] ffmpeg: enable crypto protocol for AES-128 HLS
+
+The pinned FFmpeg HLS demuxer wraps AES-128 media segments in a
+crypto+<segment URL>. GE configures FFmpeg with --disable-everything and
+enables only the HTTPS protocol explicitly, leaving CONFIG_CRYPTO_PROTOCOL
+disabled and encrypted HLS unable to open its top-level wrapper.
+
+Enable only the crypto URLProtocol. RTSP-on-GE11 keeps it out of the generic
+progressive HTTP allowlists and permits it only through the HLS-specific
+allowlists, where crypto.c propagates the same parent whitelist to the nested
+HTTP(S) segment URL.
+
+This is a project-authored build integration patch, not an upstream GE patch.
+---
+ Makefile.in | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/Makefile.in b/Makefile.in
+index 63fa764..a27cd2d 100644
+--- a/Makefile.in
++++ b/Makefile.in
+@@ -310,6 +310,7 @@ FFMPEG_CONFIGURE_ARGS := \
+ 	--enable-gnutls \
+ 	--enable-demuxers \
+ 	--enable-protocol=https \
++	--enable-protocol=crypto \
+ 	--enable-decoders \
+ 	--enable-encoders \
+ 	--enable-bsfs \

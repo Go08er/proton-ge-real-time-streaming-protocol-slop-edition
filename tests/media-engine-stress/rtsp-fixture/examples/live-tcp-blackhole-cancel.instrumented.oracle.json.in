@@ -1,0 +1,109 @@
+{
+  "audio_check_labels": [
+    "rtsp-blackhole-precondition"
+  ],
+  "checkpoint_expectations": [
+    {
+      "action": "snapshot",
+      "ended": false,
+      "has_audio": true,
+      "has_video": true,
+      "label": "rtsp-blackhole-precondition",
+      "max_matches": 1,
+      "max_source_generation": 1,
+      "min_matches": 1,
+      "min_source_generation": 1,
+      "paused": false,
+      "seeking": false
+    },
+    {
+      "action": "snapshot",
+      "ended": false,
+      "has_audio": true,
+      "has_video": true,
+      "label": "rtsp-blackhole-before-resume",
+      "max_matches": 1,
+      "max_source_generation": 1,
+      "min_matches": 1,
+      "min_source_generation": 1,
+      "paused": true,
+      "seeking": false
+    },
+    {
+      "action": "snapshot",
+      "ended": false,
+      "has_audio": true,
+      "has_video": true,
+      "label": "rtsp-blackhole-before-shutdown",
+      "max_matches": 1,
+      "max_source_generation": 1,
+      "min_matches": 1,
+      "min_source_generation": 1,
+      "paused": false,
+      "seeking": false
+    }
+  ],
+  "event_order": [
+    "CANPLAY",
+    "PLAYING",
+    "PAUSE",
+    "PLAYING"
+  ],
+  "expected_driver_sha256": "@DRIVER_SHA256@",
+  "expected_exit_code": 0,
+  "expected_result": "pass",
+  "expected_scenario_sha256": "@SCENARIO_SHA256@",
+  "forbidden_events": [
+    "ERROR",
+    "STREAMRENDERINGERROR",
+    "SEEKING",
+    "SEEKED",
+    "ENDED"
+  ],
+  "max_audio_nonzero_silence_ms": 750,
+  "max_audio_silence_ms": 750,
+  "max_event_counts": {
+    "PAUSE": 1
+  },
+  "max_media_error_events": 0,
+  "max_source_generations": 1,
+  "max_timeout_snapshots": 0,
+  "min_action_counts": {
+    "load": 1,
+    "pause": 1,
+    "play": 2,
+    "shutdown": 1,
+    "snapshot": 4,
+    "wait_event": 4,
+    "wait_ms": 2
+  },
+  "min_audio_bytes_generation": 4096,
+  "min_audio_nonzero_units_generation": 20,
+  "min_audio_samples_generation": 10,
+  "min_source_generations": 1,
+  "require_audio_each_generation": true,
+  "require_av_same_snapshot_each_generation": true,
+  "require_video_each_generation": true,
+  "required_actions": [
+    "load",
+    "pause",
+    "play",
+    "snapshot",
+    "shutdown"
+  ],
+  "required_audio_payload_formats": [
+    "pcm16",
+    "pcm32",
+    "float32"
+  ],
+  "required_events": [
+    "CANPLAY",
+    "PAUSE",
+    "PLAYING"
+  ],
+  "required_events_per_generation": [
+    "CANPLAY",
+    "PAUSE",
+    "PLAYING"
+  ]
+}

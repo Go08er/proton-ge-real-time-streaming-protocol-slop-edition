@@ -1,0 +1,14 @@
+# SPDX-License-Identifier: BSD-3-Clause
+# Give the delayed old generation a far pending seek, then replace it.  Only
+# generation two may become ready and play from its own near-zero timeline.
+load "http://127.0.0.1:18765/media?generation=old"
+seek @OLD_SEEK@
+wait_ms 100
+replace "http://127.0.0.1:18765/media?generation=new"
+wait_event CANPLAY 15000
+play
+wait_event PLAYING 5000
+wait_time @STARTUP_WAIT@ 5000
+wait_time @REPLACEMENT_WAIT@ 10000
+snapshot "replacement-generation-steady"
+shutdown

@@ -1,0 +1,61 @@
+{
+  "audio_check_labels": [
+    "live-steady"
+  ],
+  "checkpoint_expectations": [
+    {
+      "action": "snapshot",
+      "ended": false,
+      "has_audio": true,
+      "has_video": true,
+      "label": "live-steady",
+      "max_matches": 8,
+      "min_matches": 8,
+      "min_time_span": 5.0,
+      "paused": false,
+      "seeking": false
+    }
+  ],
+  "expected_exit_code": 0,
+  "expected_driver_sha256": "70ba4f15f8d96a0890555ff1847050d7a45ebe1efe6479c42dd62a0cb22e808a",
+  "expected_result": "pass",
+  "expected_scenario_sha256": "33deda29e5ac9ced774a2ce091ea2b0d3488f8261a8f22fb4c39c0a4e1b5db6e",
+  "forbidden_events": [
+    "ERROR",
+    "STREAMRENDERINGERROR"
+  ],
+  "max_audio_silence_ms": 500,
+  "max_audio_nonzero_silence_ms": 500,
+  "max_media_error_events": 0,
+  "max_timeout_snapshots": 0,
+  "min_audio_bytes_generation": 4096,
+  "min_audio_nonzero_units_generation": 20,
+  "min_audio_samples_generation": 20,
+  "min_playback_advance": 5.0,
+  "min_source_generations": 1,
+  "min_action_counts": {
+    "snapshot": 8,
+    "wait_ms": 8
+  },
+  "required_audio_payload_formats": [
+    "pcm16",
+    "pcm32",
+    "float32"
+  ],
+  "require_audio_each_generation": true,
+  "require_av_same_snapshot_each_generation": true,
+  "require_video_each_generation": true,
+  "required_actions": [
+    "load",
+    "play",
+    "snapshot",
+    "shutdown"
+  ],
+  "required_events": [
+    "CANPLAY",
+    "PLAYING"
+  ],
+  "required_events_per_generation": [
+    "CANPLAY"
+  ]
+}

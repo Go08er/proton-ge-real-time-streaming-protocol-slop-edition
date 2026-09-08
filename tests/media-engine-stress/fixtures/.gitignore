@@ -1,0 +1,8 @@
+_out/
+result
+result-*
+*.mp4
+*.m4a
+*.ts
+*.m3u8
+*.bin

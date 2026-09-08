@@ -1,0 +1,4 @@
+0001-avcodec-magicyuv-reject-slice_height-misaligned-with.patch
+0002-avcodec-magicyuv-Expand-the-s-interlaced-slice-heigh.patch
+0003-avcodec-magicyuv-Fix-1-line-MEDIAN-slices.patch
+0004-avformat-tls-enable-peer-verification-by-default-on-ffmpeg-62.patch

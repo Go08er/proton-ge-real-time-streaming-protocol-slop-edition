@@ -1,0 +1,24 @@
+# SPDX-License-Identifier: BSD-3-Clause
+# Ten source generations exercise the per-source rtspdrain record budgets in
+# one MediaEngine process. The immutable case generator admits this scenario
+# only with RTSPT and the measured high-rate capture.
+load "rtsp://127.0.0.1:18554/fixture"
+wait_event CANPLAY 20000
+play
+wait_event PLAYING 10000
+loop 4
+wait_ms 1000
+snapshot "rtsp-drain-diagnostics"
+endloop
+
+loop 9
+replace "rtsp://127.0.0.1:18554/fixture"
+wait_event CANPLAY 20000
+play
+wait_event PLAYING 10000
+loop 4
+wait_ms 1000
+snapshot "rtsp-drain-diagnostics"
+endloop
+endloop
+shutdown
