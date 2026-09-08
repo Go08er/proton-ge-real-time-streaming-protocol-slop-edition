@@ -3,6 +3,16 @@
 Experimental x86_64 Linux prerelease, built and qualified on 2026-09-08.
 Intended for users experienced with Proton debugging; assistance is not guaranteed.
 
+Nix packaging follow-up: use tag `se1-nix1`. The original `se1` tag's local
+archive override was verified, but its default download path failed because
+`callPackage` injected Nixpkgs' unrelated `src` package into an optional
+argument. Renaming that argument to `localArchive` fixes evaluation without
+changing the SE1 binary, source pin or checksums. The original tag is retained.
+The corrected default package downloaded and hash-checked the actual public
+release successfully. Both packaging argument tests fail on the old code and
+pass on the corrected code; the local override remains supported under its
+new `localArchive` argument name.
+
 Tool name: `proton-ge-11-6-rtsp-se1`.
 
 SE1 carries the same 21 Wine media patches as the co-tested A3.23 candidate.

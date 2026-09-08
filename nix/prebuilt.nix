@@ -1,10 +1,10 @@
-{ lib, stdenvNoCC, fetchurl, src ? null }:
+{ lib, stdenvNoCC, fetchurl, localArchive ? null }:
 let
   release = import ./release.nix;
 in stdenvNoCC.mkDerivation {
   pname = "proton-ge-rtsp-slop-edition";
   version = "se1";
-  src = if src != null then src else fetchurl {
+  src = if localArchive != null then localArchive else fetchurl {
     inherit (release) url hash;
   };
   sourceRoot = "proton-ge-11-6-rtsp-se1";

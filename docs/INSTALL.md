@@ -33,7 +33,7 @@ wrappers, if needed by your setup, remain your own configuration.
 Add this repository as a flake input and import its module:
 
 ```nix
-inputs.rtsp-se1.url = "github:Go08er/proton-ge-real-time-streaming-protocol-slop-edition/se1";
+inputs.rtsp-se1.url = "github:Go08er/proton-ge-real-time-streaming-protocol-slop-edition/se1-nix1";
 
 # In the NixOS configuration, with rtsp-se1 passed through specialArgs:
 imports = [ rtsp-se1.nixosModules.default ];
@@ -63,13 +63,17 @@ can be installed manually as above, or wrapped in the same Nix package:
 ```nix
 programs.proton-ge-rtsp.package = pkgs.callPackage
   "${rtsp-se1}/nix/prebuilt.nix" {
-    src = /path/to/your/verified/proton-ge-11-6-rtsp-se1.tar.gz;
+    localArchive = /path/to/your/verified/proton-ge-11-6-rtsp-se1.tar.gz;
   };
 ```
 
 The source-build app runs the pinned GE build in an offline Podman container;
 it is deliberately not advertised as a pure `nix build` compilation derivation.
 Do not disable the Nix sandbox to pretend otherwise.
+
+Use the `se1-nix1` packaging tag, not the original `se1` tag, for Nix.
+It fixes a `callPackage` argument collision in the default remote-download
+path. The SE1 binary, source pin and release checksums are unchanged.
 
 The package layout follows the
 [Nixpkgs GE package](https://github.com/NixOS/nixpkgs/blob/nixos-unstable/pkgs/by-name/pr/proton-ge-bin/package.nix)
