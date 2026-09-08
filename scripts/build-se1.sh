@@ -104,7 +104,7 @@ if [[ "$use_release_inputs" == 1 ]]; then
     36a76f1dfd8baf250056dfdff71295f68fb5ebf91786730d5b6420b283733033 \
     "$bundle" | sha256sum --check --status
   mkdir -- "$contrib_cache"
-  tar --zstd -xf "$bundle" -C "$contrib_cache"
+  tar --zstd --same-permissions -xf "$bundle" -C "$contrib_cache"
 fi
 scripts/prefetch-pinned-ge-contrib.sh --config "$PINNED_GE_CONFIG" \
   --source "$source_dir" --cache-dir "$contrib_cache"
