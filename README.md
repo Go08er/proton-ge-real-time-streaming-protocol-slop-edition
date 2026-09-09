@@ -1,9 +1,12 @@
 # Proton GE Real-Time Streaming Protocol — Slop Edition
 
-An experimental patchset aiming to recover RTSP playback capabilities
-comparable to the GStreamer-based RTSP path, **specifically for VRChat**, on
-GE-Proton's WineDMO and FFmpeg stack. This is a capability goal, not a claim
-of complete parity, and does not add GStreamer or a second media backend.
+An experimental patchset for RTSP, other streaming video and livestream
+playback on GE-Proton's WineDMO and FFmpeg stack. The goal is **a good
+streaming experience in VRChat without GStreamer**, including RTSP
+capabilities comparable to the GStreamer-based path. This is a development
+goal, not a claim of complete parity. Support for other games is not the
+project's focus, and no second media backend is added.
+
 The project's patchset was developed by GPT-6 Astra under human-maintainer
 direction, retaining credited upstream contributions.
 
@@ -16,6 +19,8 @@ direction, retaining credited upstream contributions.
 
 - RTSP/RTP network-video support on GE's WineDMO → FFmpeg path, including
   the `rtspt://` TCP alias used by tested VRChat players.
+- Additional HTTP(S), HLS and on-demand video playback fixes, covering
+  streaming and livestream scenarios beyond RTSP.
 - Playback-state, seeking, source-replacement and audio-timeline corrections.
 - Good audio/video synchronization in the maintainer's tested scenarios,
   reported as an improvement over the reference setup. This is an observation,
