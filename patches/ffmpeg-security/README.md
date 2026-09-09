@@ -2,7 +2,24 @@
 
 This directory contains the FFmpeg security patch series for the GE-pinned
 FFmpeg commit `9047fa1b084f76b1b4d065af2d743df1b40dfb56`. Apply the files in
-the exact order recorded by `series`.
+the exact order recorded by the [machine-readable series](series).
+
+[Back to all patches](../README.md).
+
+## Patch-by-patch guide
+
+These are FFmpeg changes, not the Wine playback series. Click a descriptive
+title to read the patch explanation and diff. The first three also have
+individual upstream commit pages; the fourth is a project adaptation.
+
+| Order | Patch — open explanation and diff | Purpose and origin |
+| --- | --- | --- |
+| 1 | [Reject misaligned MagicYUV slice heights](0001-avcodec-magicyuv-reject-slice_height-misaligned-with.patch) | Rejects slice heights inconsistent with chroma subsampling to prevent out-of-array access. [Upstream commit](https://github.com/FFmpeg/FFmpeg/commit/374b726ffa878ee1cadb987bd1e1e20cc7ed8845). |
+| 2 | [Expand the interlaced MagicYUV slice check](0002-avcodec-magicyuv-Expand-the-s-interlaced-slice-heigh.patch) | Extends slice-height validation for interlaced content to address out-of-array access. [Upstream commit](https://github.com/FFmpeg/FFmpeg/commit/5806e8b9f34f1b0663b3017ef9dd1aa5d08116d1). |
+| 3 | [Fix one-line MagicYUV MEDIAN slices](0003-avcodec-magicyuv-Fix-1-line-MEDIAN-slices.patch) | Corrects decoding of the one-line slice case. [Upstream commit](https://github.com/FFmpeg/FFmpeg/commit/c23d4da3128c279b714b282e6ec292e8755007e3). |
+| 4 | [Verify TLS peers by default](0004-avformat-tls-enable-peer-verification-by-default-on-ffmpeg-62.patch) | Enables the existing certificate-verification default for the retained libavformat 62 ABI, including nested HLS requests. Project-authored adaptation; not a CVE backport. |
+
+The detailed provenance, exact hashes and verification requirements follow.
 
 ## Upstream CVE backports
 

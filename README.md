@@ -51,14 +51,17 @@ revision and apply the selected, ordered patches at the documented points in
 GE's preparation workflow. The upstream source is not duplicated in this
 checkout.
 
-[Reading the patch series](docs/PATCHES.md) explains how to find the selected
-pin, follow the Wine and FFmpeg changes, and distinguish release inputs from
-historical candidates. Exact versions, checksums, build options and test
-results belong in the release and source documentation, not this overview.
+[Browse the patches and their explanations](patches/README.md) for a
+patch-by-patch overview. The [review and replay guide](docs/PATCHES.md)
+explains how to find the selected pin, follow application order, and
+distinguish release inputs from historical candidates. Exact versions,
+checksums, build options and test results belong in the release and source
+documentation, not this overview.
 
 ## Start here
 
 - [Release notes](RELEASE.md): exact build, changes and qualification.
+- [Patch index](patches/README.md): individual changes, explanations and code links.
 - [Downloads and release history](https://github.com/Go08er/proton-ge-real-time-streaming-protocol-slop-edition/releases).
 - [Installation and NixOS](docs/INSTALL.md).
 - [Build from source](docs/BUILDING.md).

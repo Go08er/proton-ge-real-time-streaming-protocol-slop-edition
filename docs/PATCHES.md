@@ -1,5 +1,9 @@
 # Reading the patch series
 
+For a clickable list with a plain-English explanation of each change, start
+with the [patch index](../patches/README.md). This page explains selection
+and replay rather than requiring you to browse the raw `series` manifests.
+
 This repository carries changes **on top of GE-Proton**, rather than a copy
 of GE's complete Git history. The build obtains the upstream source named by
 an immutable pin. Patches remain separate, reviewable diffs; the selected
@@ -13,8 +17,9 @@ for the checkout or release tag you are reviewing. For SE1, the selected pair
 is:
 
 - [Base/build pin](../config/ge-proton11-6-se1.env).
-- [Ordered Wine series](../patches/series-ge-proton11-6-se1), containing 21
-  patch paths relative to `patches/`.
+- [Machine-readable Wine order](../patches/series-ge-proton11-6-se1), containing
+  21 patch paths relative to `patches/`, with an
+  [explained list](../patches/README.md#wine-media-and-vr-patches) for browsing.
 
 The [source-build entrypoint](../scripts/build-se1.sh) explicitly selects
 both files. The pin records the GE commit, component revisions, input hashes,
@@ -54,10 +59,10 @@ proof of correctness or playback compatibility.
 - The [Wine hook](../scripts/apply-pinned-rtsp-series.sh) first applies the
   pin's separate GE media-cleanup normalization, then checks and applies the
   selected Wine patches in order, with Git validation and zero GNU patch fuzz.
-- [FFmpeg source patches](../patches/ffmpeg-security/README.md) have their
-  own [series](../patches/ffmpeg-security/series), separate from Wine.
+- [FFmpeg source patches and explanations](../patches/ffmpeg-security/README.md#patch-by-patch-guide)
+  have their own [machine-readable order](../patches/ffmpeg-security/series), separate from Wine.
 - [FFmpeg build integration](../patches/ffmpeg-build/README.md) has a separate
-  [series](../patches/ffmpeg-build/series) affecting GE's `Makefile.in`.
+  [machine-readable order](../patches/ffmpeg-build/series) affecting GE's `Makefile.in`.
   The selected pin supplies its release-specific expected postimage.
 - Launcher behavior is a separate pin policy. SE1 uses GE's unchanged
   launcher; the retained launcher compatibility patch is not applied.

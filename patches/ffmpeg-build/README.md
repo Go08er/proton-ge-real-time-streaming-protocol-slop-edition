@@ -1,5 +1,21 @@
 # FFmpeg build-integration patch series
 
+[Back to all patches](../README.md).
+
+## Patch at a glance
+
+[Enable FFmpeg's crypto protocol for AES-128 HLS](0001-ffmpeg-enable-crypto-protocol-for-AES-128-HLS.patch)
+adds the configure switch needed to read encrypted HLS segments. It changes
+GE's `Makefile.in`, not Wine or FFmpeg decoder code, and does not bypass the
+media route's protocol restrictions. The [series file](series) is the
+machine-readable order; the linked patch contains the explanation and diff.
+
+The provenance below includes historical base hashes. For SE1, use the
+release-specific expected postimage in its
+[pin](../../config/ge-proton11-6-se1.env), not those historical postimages.
+
+## Provenance
+
 This directory contains the RTSP-on-GE11 build-integration series, originally
 authored against `9fad3bbe270409e67a8d2f4d123afc73d848306a` and strictly replayed
 for A3.12 on `bb1caad333b08cf87d49d0f794a538502d992eae`. Apply the files in the
