@@ -34,8 +34,10 @@ direction, retaining credited upstream contributions.
 
 ## Trade-offs
 
-Stability may be lower than stock GE, and compatibility with particular video
-formats, servers or world players may be worse. Tests cover selected paths,
+Stability may be lower than
+[SpookySkeletons' Proton-RTSP](https://github.com/SpookySkeletons/proton-rtsp),
+and compatibility with particular video formats, servers or world players
+may be worse. Tests cover selected paths,
 not every game, codec or device. Included optional GE components and known
 limitations are documented for each release; not every GE payload is
 necessarily bundled. World-side URL handling, unavailable content, VPNs,
