@@ -19,8 +19,9 @@ including VRChat, without adding a second media backend.
 - Good audio/video synchronization in the maintainer's tested scenarios,
   reported as an improvement over the reference setup. This is an observation,
   not a universal or quantitatively benchmarked guarantee.
-- The GE-Proton11-6 foundation, including WineWayland and its bundled Discord
-  RPC bridge. A separate host Steam-wrapper script is not installed or managed
+- A pinned GE-Proton foundation, retaining features such as WineWayland and
+  the bundled Discord RPC bridge, subject to each release's documented build
+  options. A separate host Steam-wrapper script is not installed or managed
   by this project.
 - Bounded opt-in diagnostics for investigating failures without broad media
   tracing. Logs must still be treated as private.
@@ -29,18 +30,28 @@ including VRChat, without adding a second media backend.
 
 Stability may be lower than stock GE, and compatibility with particular video
 formats, servers or world players may be worse. Tests cover selected paths,
-not every game, codec or device. This build also excludes GE's optional
-NVIDIA-library and Vulkan-layer bundles; it is not a claim that every optional
-GE payload is included. World-side URL handling, unavailable content, VPNs,
+not every game, codec or device. Included optional GE components and known
+limitations are documented for each release; not every GE payload is
+necessarily bundled. World-side URL handling, unavailable content, VPNs,
 headset streaming and host audio can fail independently of this patchset.
 
-The obsolete `PROTON_XR_MODE` compatibility flag is not implemented in SE1.
-WineWayland's VR device-extension support remains. There is no automatic
-reconnect loop or blanket retry policy.
+## How the repository is organized
+
+This is a downstream patchset and build-tooling repository, not a GitHub fork
+containing GE's full source history. Builds acquire an exact upstream GE
+revision and apply the selected, ordered patches at the documented points in
+GE's preparation workflow. The upstream source is not duplicated in this
+checkout.
+
+[Reading the patch series](docs/PATCHES.md) explains how to find the selected
+pin, follow the Wine and FFmpeg changes, and distinguish release inputs from
+historical candidates. Exact versions, checksums, build options and test
+results belong in the release and source documentation, not this overview.
 
 ## Start here
 
-- [SE1 prerelease notes](RELEASE.md): exact build, changes and qualification.
+- [Release notes](RELEASE.md): exact build, changes and qualification.
+- [Downloads and release history](https://github.com/Go08er/proton-ge-real-time-streaming-protocol-slop-edition/releases).
 - [Installation and NixOS](docs/INSTALL.md).
 - [Build from source](docs/BUILDING.md).
 - [Testing and safe issue reports](docs/TESTING.md).
